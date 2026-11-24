@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+# data and runs never go to git (patient data, large files)
+/data/
+/runs/
+*.pt
+*.npz
+.orch/

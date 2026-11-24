@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carmen-numeric"
+version = "0.1.0"
+description = "UniTTab-style encoder for perioperative numerical data (vital-sign trends, labs, demographics), to be fused with CARMEN"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.24",
+    "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+vitaldb = ["vitaldb>=1.4"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["carmen_numeric*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/orch/orchctl.py" = ["E501"]  # vendored from Biosignal-Foundation-Model
