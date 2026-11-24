@@ -1,62 +1,75 @@
 #!/usr/bin/env bash
-# Runs ON the 주경야독 GPU node — submit it with
+# Runs ON the 주경야독 GPU node (sovereign-llm-3). Submit with orchctl, one step at a time:
 #
-#   python scripts/orch/orchctl.py up --gpus 8
-#   STEPS=30000 python scripts/orch/orchctl.py runfile scripts/orch/node_pretrain.sh
+#   python scripts/orch/orchctl.py up --gpus 0            # CPU session for code + prep
+#   python scripts/orch/orchctl.py runfile --raw scripts/orch/node_pretrain.sh   # STEP=code (default)
+#   STEP=prep  ... (prepend `export STEP=prep` to the script, or set it in env.sh)
+#   python scripts/orch/orchctl.py up --gpus 1            # GPU session for training
+#   STEP=train ...
 #
-# (orchctl injects the script through stdin; variables below can be overridden by
-# prefixing them inside the script or exporting them in $ORCH_HOME/env.sh.)
+# orchctl sends the file through stdin, so set variables by editing the first lines
+# (or `printf 'export STEP=train\n' | cat - node_pretrain.sh > /tmp/x.sh` and runfile that).
 #
-# Layout under $ORCH_HOME/carmen_numeric:
-#   code/   repo checkout (git clone, or the tarball pushed with orchctl push)
-#   .venv/  persistent python env
-#   data/vitaldb/  numerical-row cache built from $ORCH_HOME/vitaldb/raw/*.vital
-#   runs/<RUN>/    checkpoints + log.jsonl; runs/<RUN>.log is stdout
+# Since the 2026-11 move, $ORCH_HOME is not set inside sessions; the account's files are
+# still under the old path, which is the default BASE below.
 set -euo pipefail
-: "${ORCH_HOME:?ORCH_HOME is not set — run this on the node}"
 
-ROOT="${ROOT:-$ORCH_HOME/carmen_numeric}"
-CODE="${CODE:-$ROOT/code}"
-VENV="${VENV:-$ROOT/.venv}"
+STEP="${STEP:-code}"
+BASE="${ORCH_HOME:-/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd}"
+ROOT="${ROOT:-$BASE/carmen_numeric}"
+CODE="$ROOT/code"
+BRANCH="${BRANCH:-main}"
+PY="${PY:-$BASE/venvs/carmen/bin/python}"   # torch 2.11 + cu130, numpy, pandas, vitaldb
 DATA="${DATA:-$ROOT/data/vitaldb}"
-VITAL_DIR="${VITAL_DIR:-$ORCH_HOME/vitaldb/raw}"
-CASES_CSV="${CASES_CSV:-$ORCH_HOME/aki/csv/clinical_data.csv}"
-LABS_CSV="${LABS_CSV:-$ORCH_HOME/aki/csv/lab_data.csv}"
+VITAL_DIR="${VITAL_DIR:-$BASE/vitaldb/raw}"
+CASES_CSV="${CASES_CSV:-$BASE/aki/csv/clinical_data.csv}"
+LABS_CSV="${LABS_CSV:-$BASE/aki/csv/lab_data.csv}"
+PREP_WORKERS="${PREP_WORKERS:-48}"
 PRESET="${PRESET:-base}"
 STEPS="${STEPS:-30000}"
-BATCH="${BATCH:-64}"
+BATCH="${BATCH:-128}"
 LR="${LR:-2e-4}"
 RUN="${RUN:-unittab_${PRESET}_$(date +%Y%m%d_%H%M)}"
-PREP_WORKERS="${PREP_WORKERS:-32}"
+# HOME is the per-session workspace; keep caches with the persistent files
+export XDG_CACHE_HOME="$BASE/.cache" PIP_CACHE_DIR="$BASE/.cache/pip" TORCH_HOME="$BASE/.cache/torch"
 
-mkdir -p "$ROOT" "$ROOT/runs"
-[ -d "$CODE" ] || { echo "no code at $CODE — clone or push the repo first"; exit 1; }
+mkdir -p "$ROOT/runs" "$ROOT/logs"
+cd "$ROOT"
 
-if [ ! -x "$VENV/bin/python" ]; then
-  python3 -m venv "$VENV"
-  "$VENV/bin/pip" install -q --upgrade pip
-  "$VENV/bin/pip" install -q torch numpy pandas vitaldb
-fi
-PY="$VENV/bin/python"
-"$PY" - <<'EOF'
-import torch
-print("torch", torch.__version__, "cuda", torch.cuda.is_available(), "gpus", torch.cuda.device_count())
-EOF
-
-if [ ! -f "$DATA/normalizer.json" ]; then
-  echo "[prep] building cache in $DATA"
-  args=(--out "$DATA" --vital-dir "$VITAL_DIR" --workers "$PREP_WORKERS")
-  [ -f "$CASES_CSV" ] && args+=(--cases-csv "$CASES_CSV")
-  [ -f "$LABS_CSV" ] && args+=(--labs-csv "$LABS_CSV")
-  "$PY" "$CODE/scripts/prepare_vitaldb.py" "${args[@]}"
-fi
-
-NGPU=$("$PY" -c "import torch; print(max(torch.cuda.device_count(), 1))")
-echo "[train] run=$RUN preset=$PRESET steps=$STEPS gpus=$NGPU"
-# detached: the job returns at once, poll runs/$RUN.log
-( setsid nohup "$VENV/bin/torchrun" --standalone --nproc_per_node "$NGPU" \
-    "$CODE/scripts/pretrain.py" --data "$DATA" --out "$ROOT/runs/$RUN" \
-    --preset "$PRESET" --steps "$STEPS" --batch-size "$BATCH" --lr "$LR" \
-    --amp bf16 --workers 8 --eval-every 2000 \
-    > "$ROOT/runs/$RUN.log" 2>&1 < /dev/null & )
-echo "started; log: $ROOT/runs/$RUN.log"
+case "$STEP" in
+code)
+  # no git on the node: fetch the branch tarball from codeload (as bin/update_code.sh does)
+  curl -sSL -o repo.tar.gz \
+    "https://codeload.github.com/dlcjfgmlnasa/carmen-numeric/tar.gz/refs/heads/$BRANCH"
+  rm -rf .code_new && mkdir .code_new && tar xzf repo.tar.gz -C .code_new --strip-components=1
+  rm -rf "$CODE" && mv .code_new "$CODE" && rm -f repo.tar.gz
+  echo "code updated to $BRANCH:"; ls "$CODE"
+  ;;
+prep)
+  LOG="$ROOT/logs/prep_$(date +%Y%m%d_%H%M).log"
+  ( cd "$CODE" && setsid nohup "$PY" scripts/prepare_vitaldb.py --out "$DATA" \
+      --vital-dir "$VITAL_DIR" --cases-csv "$CASES_CSV" --labs-csv "$LABS_CSV" \
+      --workers "$PREP_WORKERS" > "$LOG" 2>&1 < /dev/null & )
+  echo "prep started; log: $LOG"
+  ;;
+train)
+  [ -f "$DATA/normalizer.json" ] || { echo "no cache at $DATA — run STEP=prep first"; exit 1; }
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+  NGPU=$("$PY" -c "import torch; print(max(torch.cuda.device_count(), 1))")
+  LOG="$ROOT/runs/$RUN.log"
+  echo "[train] run=$RUN preset=$PRESET steps=$STEPS gpus=$NGPU batch/gpu=$BATCH"
+  if [ "$NGPU" -gt 1 ]; then
+    LAUNCH=("$PY" -m torch.distributed.run --standalone --nproc_per_node "$NGPU")
+  else
+    LAUNCH=("$PY")
+  fi
+  ( cd "$CODE" && setsid nohup "${LAUNCH[@]}" scripts/pretrain.py --data "$DATA" \
+      --out "$ROOT/runs/$RUN" --preset "$PRESET" --steps "$STEPS" --batch-size "$BATCH" \
+      --lr "$LR" --amp bf16 --workers 8 --eval-every 2000 --eval-batches 400 \
+      > "$LOG" 2>&1 < /dev/null & )
+  echo "started; log: $LOG"
+  ;;
+*)
+  echo "unknown STEP=$STEP (code | prep | train)"; exit 1
+  ;;
+esac

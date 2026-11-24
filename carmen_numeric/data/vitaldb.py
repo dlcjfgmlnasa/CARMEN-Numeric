@@ -106,7 +106,9 @@ LAB_PREFIX = "lab_"  # lab field names are prefixed so they never clash with mon
 def vitaldb_schema() -> TableSchema:
     fields: list[Field] = list(TIME_FIELDS)
     fields += [Field(k, "num", valid_range=v[1], unit=v[2]) for k, v in MONITOR_TRACKS.items()]
-    fields += [Field(LAB_PREFIX + k, "num", valid_range=v[0], unit=v[1]) for k, v in LAB_FIELDS.items()]
+    fields += [
+        Field(LAB_PREFIX + k, "num", valid_range=v[0], unit=v[1]) for k, v in LAB_FIELDS.items()
+    ]
     fields += [Field(k, "num", valid_range=v[0], unit=v[1]) for k, v in STATIC_NUM.items()]
     fields += [Field(k, "cat") for k in STATIC_CAT]
     row_types = [
@@ -197,7 +199,9 @@ def build_case(
         lb = labs[(labs.dt >= start) & (labs.dt < end) & labs.name.isin(lab_names)]
         for dt, grp in lb.groupby("dt"):
             row = np.full(len(lab_names), np.nan)
-            for name, val in zip(grp.name, pd.to_numeric(grp.result, errors="coerce")):
+            for name, val in zip(
+                grp.name, pd.to_numeric(grp.result, errors="coerce"), strict=True
+            ):
                 lo, hi = LAB_FIELDS[name][0]
                 if np.isfinite(val) and lo <= val <= hi:
                     row[lab_names.index(name)] = val

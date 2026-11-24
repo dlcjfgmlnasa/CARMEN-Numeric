@@ -111,8 +111,21 @@ def request(
         headers["Content-Type"] = content_type
 
     req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    # 프록시/터널이 TLS 핸드셰이크 중 연결을 끊는 일이 잦다. 멱등 요청(GET/DELETE)만 재시도한다
+    # — POST(exec 등)를 재시도하면 잡이 두 번 제출될 수 있다.
+    tries = 4 if method in ("GET", "DELETE") else 1
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        for attempt in range(tries):
+            try:
+                resp_cm = urllib.request.urlopen(req, timeout=180)
+                break
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+                if attempt == tries - 1:
+                    sys.exit(f"ERROR: 연결 실패 ({exc}) — POST 는 재시도하지 않았다. `jobs` 로 제출 여부를 확인할 것")
+                time.sleep(2 * (attempt + 1))
+        with resp_cm as resp:
             if raw_out is not None:  # 다운로드 엔드포인트는 JSON 이 아니라 바이트를 준다
                 raw_out.parent.mkdir(parents=True, exist_ok=True)
                 with raw_out.open("wb") as fh:

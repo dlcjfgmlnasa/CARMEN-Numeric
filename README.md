@@ -73,20 +73,23 @@ fill). Beating `nearest` on dense vitals is the real bar.
 
 ## On the 주경야독 GPU node
 
-`scripts/orch/orchctl.py` reads `ORCH_PAT` (a `pat_…` token from the portal) from the
-environment or `~/.orch/orch.env`; the base URL defaults to
-`https://koreahealth.io/compute`.
+`scripts/orch/orchctl.py` reads `ORCH_PAT` (a `pat_…` token) from the environment or
+`~/.orch/orch.env`; the base URL defaults to `https://koreahealth.io/compute`.
+`vital-lab-1` is a shared lab account: check `orchctl.py ps` and use only the GPUs
+assigned to your own session.
 
 ```bash
 python scripts/orch/orchctl.py me
-python scripts/orch/orchctl.py up --gpus 8
-python scripts/orch/orchctl.py runfile scripts/orch/node_pretrain.sh
+python scripts/orch/orchctl.py up --gpus 0          # CPU session: code + data prep
+python scripts/orch/orchctl.py runfile --raw scripts/orch/node_pretrain.sh   # STEP=code
+# STEP=prep, then in a GPU session (up --gpus 1) STEP=train — see the script header
 python scripts/orch/orchctl.py down
 ```
 
-`node_pretrain.sh` builds the cache from `$ORCH_HOME/vitaldb/raw/*.vital` (and the
-clinical / lab CSVs under `$ORCH_HOME/aki/csv/`) and launches `torchrun` detached.
-Patient data stays on the node; only code goes through git.
+Since the 2026-11 service move `$ORCH_HOME` is unset inside sessions; the script falls
+back to the account's old path, which holds `vitaldb/raw/*.vital`,
+`aki/csv/{clinical,lab}_data.csv` and `venvs/carmen` (torch 2.11 + cu130). The node has
+no git, so code comes in as the GitHub branch tarball. Patient data stays on the node.
 
 ## Next
 
