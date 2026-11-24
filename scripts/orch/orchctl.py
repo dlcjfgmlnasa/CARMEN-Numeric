@@ -100,7 +100,11 @@ def request(
     raw_out: Path | None = None,
     data: bytes | None = None,
     content_type: str | None = None,
+    already_done: Any = None,
 ) -> Any:
+    """``already_done``: for a POST, a callable run after a connection failure. It returns
+    the created resource if the server did get the request (then it is not re-sent), or
+    ``None`` (then the POST is retried)."""
     url = cfg["ORCH_BASE_URL"] + path
     payload = data
     headers = {"Authorization": f"Bearer {cfg['ORCH_PAT']}"}
@@ -111,9 +115,11 @@ def request(
         headers["Content-Type"] = content_type
 
     req = urllib.request.Request(url, data=payload, headers=headers, method=method)
-    # 프록시/터널이 TLS 핸드셰이크 중 연결을 끊는 일이 잦다. 멱등 요청(GET/DELETE)만 재시도한다
-    # — POST(exec 등)를 재시도하면 잡이 두 번 제출될 수 있다.
-    tries = 4 if method in ("GET", "DELETE") else 1
+    # 프록시/터널이 TLS 핸드셰이크 중 연결을 끊는 일이 잦다. GET/DELETE 는 그냥 재시도하고,
+    # POST 는 ``already_done`` 으로 서버에 도달했는지 확인한 뒤에만 재시도한다
+    # (그냥 재시도하면 세션·잡이 두 번 만들어질 수 있다).
+    idempotent = method in ("GET", "DELETE")
+    tries = 5 if (idempotent or already_done is not None) else 1
     try:
         for attempt in range(tries):
             try:
@@ -123,8 +129,13 @@ def request(
                 raise
             except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
                 if attempt == tries - 1:
-                    sys.exit(f"ERROR: 연결 실패 ({exc}) — POST 는 재시도하지 않았다. `jobs` 로 제출 여부를 확인할 것")
+                    sys.exit(f"ERROR: 연결 실패 ({exc}) — `ps` / `jobs` 로 상태를 확인할 것")
                 time.sleep(2 * (attempt + 1))
+                if not idempotent and already_done is not None:
+                    done = already_done()
+                    if done is not None:
+                        print("(연결이 끊겼지만 요청은 처리됐다 — 재전송하지 않음)", file=sys.stderr)
+                        return done
         with resp_cm as resp:
             if raw_out is not None:  # 다운로드 엔드포인트는 JSON 이 아니라 바이트를 준다
                 raw_out.parent.mkdir(parents=True, exist_ok=True)
@@ -223,11 +234,19 @@ def exec_script(
 
     명령 문자열을 그대로 보내면 개행/따옴표가 깨지므로 항상 ``bash -s`` + stdin 을 쓴다.
     """
+    before = {j["id"] for j in request(cfg, "GET", "/jobs?limit=50")}
+
+    def already_done():  # 연결이 끊긴 POST 가 실제로 잡을 만들었는지
+        new = [j for j in request(cfg, "GET", "/jobs?limit=50")
+               if j["id"] not in before and j.get("command") == "bash -s"]
+        return {"job_id": new[0]["id"]} if new else None
+
     res = request(
         cfg,
         "POST",
         f"/sessions/{sid}/exec",
         {"command": "bash -s", "stdin": script, "timeout_sec": timeout},
+        already_done=already_done,
     )
     job_id = res["job_id"]
     if not wait:
@@ -276,8 +295,15 @@ def cmd_up(cfg, args):
     body: dict[str, Any] = {"gpu_count": args.gpus}
     if args.gpu_model:
         body["gpu_model"] = args.gpu_model
-    session = request(cfg, "POST", f"/nodes/{node}/sessions", body)
-    save_state({"session_id": session["id"], "node_id": session["node_id"]})
+    before = {x["id"] for x in request(cfg, "GET", "/sessions")}
+
+    def already_done():  # 연결이 끊긴 POST 가 실제로 세션을 만들었는지
+        new = [x for x in request(cfg, "GET", "/sessions")
+               if x["id"] not in before and x["state"] == "active"]
+        return new[0] if new else None
+
+    session = request(cfg, "POST", f"/nodes/{node}/sessions", body, already_done=already_done)
+    save_state({"session_id": session["id"], "node_id": session.get("node_id", node)})
     print(f"session={session['id']} state={session['state']} gpus={session['gpu_indices']}")
     print("작업이 끝나면 `orchctl.py down` 으로 반드시 반납하세요.")
 
