@@ -50,6 +50,7 @@ from carmen_numeric.data.dataset import (  # noqa: E402
     load_cases,
     to_device,
 )
+from carmen_numeric.data.vitaldb import POINT_DECODE  # noqa: E402
 from carmen_numeric.evaluate import evaluate, summarize_mae  # noqa: E402
 
 KEY_FIELDS = ["hr", "spo2", "art_mbp", "nibp_mbp", "etco2", "bis", "bt", "ppf_ce", "lab_k",
@@ -138,9 +139,15 @@ def main() -> None:
 
     train_cases = load_cases(data, split["train"])
     val_cases = load_cases(data, split["val"])
-    val_ds = WindowDataset(val_cases, norm, args.max_rows, ctx, random_crop=False)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=min(args.workers, 2), collate_fn=collate)
+    if args.data_on_device:
+        val_dl = GPUWindowBatcher(val_cases, norm, args.max_rows, ctx, device,
+                                  keep_raw=True).eval_batches(args.batch_size)
+        n_val = val_dl.num_windows
+    else:
+        val_ds = WindowDataset(val_cases, norm, args.max_rows, ctx, random_crop=False)
+        val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=min(args.workers, 2), collate_fn=collate)
+        n_val = len(val_ds)
     mask_gen = torch.Generator(device=device).manual_seed(args.seed * 1000 + rank)
     if args.data_on_device:
         batcher = GPUWindowBatcher(train_cases, norm, args.max_rows, ctx, device)
@@ -202,7 +209,7 @@ def main() -> None:
 
     if is_main:
         print(f"device={device} world={world} params={n_params / 1e6:.2f}M "
-              f"train={n_train} val windows={len(val_ds)} "
+              f"train={n_train} val windows={n_val} "
               f"cases train/val={len(train_cases)}/{len(val_cases)}", flush=True)
     log_f = open(out / "log.jsonl", "a") if is_main else None
 
@@ -252,10 +259,12 @@ def main() -> None:
             if is_main:
                 ev = evaluate(model, val_dl, norm, device, args.p_field, args.p_row,
                               args.eps, args.radius, max_batches=args.eval_batches,
-                              amp_dtype=amp_dtype)
+                              amp_dtype=amp_dtype, context_row_types=ctx,
+                              point_decode=POINT_DECODE)
                 ev_span = evaluate(model, val_dl, norm, device, eps=args.eps,
                                    radius=args.radius, max_batches=args.eval_batches,
-                                   amp_dtype=amp_dtype, span=eval_span, context_row_types=ctx)
+                                   amp_dtype=amp_dtype, span=eval_span, context_row_types=ctx,
+                                   point_decode=POINT_DECODE)
                 head = {k: ev[k] for k in ("loss", "acc_num", "acc_num_pm2", "acc_cat")}
                 head["span_loss"] = ev_span["loss"]
                 print(f"[eval step {step}] {json.dumps(head)}")

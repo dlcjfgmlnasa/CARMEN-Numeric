@@ -6,6 +6,7 @@
 #   STEP=prep  ... (prepend `export STEP=prep` to the script, or set it in env.sh)
 #   python scripts/orch/orchctl.py up --gpus 1            # GPU session for training
 #   STEP=train ...
+#   STEP=eval CKPTS="runs/a/best.pt runs/b/best.pt" SPLIT=all   # score on all of VitalDB
 #
 # orchctl sends the file through stdin, so set variables by editing the first lines
 # (or `printf 'export STEP=train\n' | cat - node_pretrain.sh > /tmp/x.sh` and runfile that).
@@ -31,8 +32,12 @@ BATCH="${BATCH:-128}"
 LR="${LR:-2e-4}"
 RUN="${RUN:-unittab_${PRESET}_$(date +%Y%m%d_%H%M)}"
 EXTRA="${EXTRA:-}"   # extra pretrain.py flags, e.g. "--span-p 0.2"
+SPLIT="${SPLIT:-all}"  # eval: train | val | test | all
+CKPTS="${CKPTS:-runs/unittab_base_v2/best.pt runs/unittab_base_span_v1/best.pt}"  # under ROOT
 # HOME is the per-session workspace; keep caches with the persistent files
 export XDG_CACHE_HOME="$BASE/.cache" PIP_CACHE_DIR="$BASE/.cache/pip" TORCH_HOME="$BASE/.cache/torch"
+# the node's 72 cores are shared and saturated: keep every BLAS/OpenMP pool small
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 PYTHONUNBUFFERED=1
 
 mkdir -p "$ROOT/runs" "$ROOT/logs"
 cd "$ROOT"
@@ -71,7 +76,16 @@ train)
       > "$LOG" 2>&1 < /dev/null & )
   echo "started; log: $LOG"
   ;;
+eval)
+  [ -f "$DATA/normalizer.json" ] || { echo "no cache at $DATA — run STEP=prep first"; exit 1; }
+  echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
+  paths=(); for c in $CKPTS; do paths+=("$ROOT/$c"); done
+  LOG="$ROOT/logs/eval_${SPLIT}_$(date +%Y%m%d_%H%M).log"
+  ( cd "$CODE" && setsid nohup "$PY" scripts/eval_ckpt.py --data "$DATA" --split "$SPLIT" \
+      "${paths[@]}" > "$LOG" 2>&1 < /dev/null & )
+  echo "eval started; log: $LOG"
+  ;;
 *)
-  echo "unknown STEP=$STEP (code | prep | train)"; exit 1
+  echo "unknown STEP=$STEP (code | prep | train | eval)"; exit 1
   ;;
 esac

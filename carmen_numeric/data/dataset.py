@@ -165,13 +165,16 @@ def collect_field_values(
 
 
 class GPUWindowBatcher:
-    """Training batches sampled entirely on the device (no DataLoader workers).
+    """Batches built entirely on the device (no DataLoader workers).
 
     All rows of all cases are transformed once and kept on ``device`` (a few hundred MB
-    for the whole of VitalDB); each call draws random cases and a random window of their
-    dynamic rows by index arithmetic. Use it when the host CPU is the bottleneck (e.g. a
-    shared node). Context rows (``context_types``) must be the first rows of each case,
-    as ``data.vitaldb.build_case`` writes them.
+    for the whole of VitalDB); windows are cut by index arithmetic. ``sample`` draws random
+    windows for training; ``eval_batches`` walks every case in non-overlapping windows
+    (the same windows as ``WindowDataset(random_crop=False)``). Use it when the host CPU
+    is the bottleneck (e.g. a shared node). Context rows (``context_types``) must be the
+    first rows of each case, as ``data.vitaldb.build_case`` writes them.
+
+    ``keep_raw`` also keeps the raw values (needed for MAE in physical units).
     """
 
     def __init__(
@@ -181,13 +184,16 @@ class GPUWindowBatcher:
         max_rows: int,
         context_types: tuple[int, ...],
         device: torch.device,
+        keep_raw: bool = False,
     ) -> None:
-        parts: dict[str, list[np.ndarray]] = {k: [] for k in
-                                              ("field_id", "num_value", "cat_value", "missing",
-                                               "target", "row_type")}
+        keys = ["field_id", "num_value", "cat_value", "missing", "target", "row_type"]
+        if keep_raw:
+            keys.append("raw")
+        parts: dict[str, list[np.ndarray]] = {k: [] for k in keys}
         n_ctx, dyn_start, dyn_len, ctx_start = [], [], [], []
         offset = 0
-        for cid in sorted(cases):
+        self.caseids = sorted(cases)
+        for cid in self.caseids:
             c = cases[cid]
             rt = c["row_type"]
             ctx = np.isin(rt, np.asarray(context_types))
@@ -198,6 +204,8 @@ class GPUWindowBatcher:
             for key in ("field_id", "num_value", "cat_value", "missing", "target"):
                 parts[key].append(tr[key])
             parts["row_type"].append(rt)
+            if keep_raw:
+                parts["raw"].append(c["values"].astype(np.float32))
             n_ctx.append(k)
             ctx_start.append(offset)
             dyn_start.append(offset + k)
@@ -205,7 +213,8 @@ class GPUWindowBatcher:
             offset += len(rt)
         cat = {k: np.concatenate(v) for k, v in parts.items()}
         dt = {"field_id": torch.int16, "cat_value": torch.int16, "target": torch.int16,
-              "row_type": torch.int8, "num_value": torch.float32, "missing": torch.bool}
+              "row_type": torch.int8, "num_value": torch.float32, "missing": torch.bool,
+              "raw": torch.float32}
         self.rows = {k: torch.as_tensor(v).to(device=device, dtype=dt[k]) for k, v in cat.items()}
         self.n_ctx = torch.tensor(n_ctx, device=device)
         self.ctx_start = torch.tensor(ctx_start, device=device)
@@ -213,17 +222,17 @@ class GPUWindowBatcher:
         self.dyn_len = torch.tensor(dyn_len, device=device)
         self.max_ctx = int(max(n_ctx))
         self.span = max_rows - self.max_ctx
+        if self.span < 1:
+            raise ValueError("max_rows too small for the context rows")
         self.device = device
         self.num_cases = len(n_ctx)
+        self._dyn_len_host = dyn_len
 
-    def sample(self, batch_size: int, generator: torch.Generator) -> dict[str, torch.Tensor]:
+    def _gather(self, case: torch.Tensor, start: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Window = context rows of ``case`` + up to ``span`` dynamic rows from ``start``."""
         dev = self.device
-        case = torch.randint(self.num_cases, (batch_size,), device=dev, generator=generator)
-        length = self.dyn_len[case]
-        take = length.clamp(max=self.span)
-        room = (length - take + 1).float()
-        start = (torch.rand(batch_size, device=dev, generator=generator) * room).long()
-        t_dyn = int(take.max())
+        take = (self.dyn_len[case] - start).clamp(min=0, max=self.span)
+        t_dyn = max(int(take.max()), 1)
         ar = torch.arange(t_dyn, device=dev)
         dyn_idx = self.dyn_start[case, None] + start[:, None] + ar  # (B, t_dyn)
         dyn_ok = ar < take[:, None]
@@ -238,7 +247,7 @@ class GPUWindowBatcher:
         idx = torch.where(ok, idx, 0)
         okk = ok.unsqueeze(-1)
         r = self.rows
-        return {
+        out = {
             "row_type": torch.where(ok, r["row_type"][idx].long(), 0),
             "field_id": torch.where(okk, r["field_id"][idx].long(), 0),
             "num_value": torch.where(okk, r["num_value"][idx], 0.0),
@@ -246,3 +255,48 @@ class GPUWindowBatcher:
             "missing": r["missing"][idx] & okk,
             "target": torch.where(okk, r["target"][idx].long(), -1),
         }
+        if "raw" in r:
+            out["raw"] = torch.where(okk, r["raw"][idx], float("nan"))
+        return out
+
+    def sample(self, batch_size: int, generator: torch.Generator) -> dict[str, torch.Tensor]:
+        """Random cases, each with a random window of its dynamic rows (training)."""
+        dev = self.device
+        case = torch.randint(self.num_cases, (batch_size,), device=dev, generator=generator)
+        length = self.dyn_len[case]
+        room = (length - length.clamp(max=self.span) + 1).float()
+        start = (torch.rand(batch_size, device=dev, generator=generator) * room).long()
+        return self._gather(case, start)
+
+    def eval_windows(self) -> list[tuple[int, int]]:
+        """Every (case index, start) of the non-overlapping evaluation windows."""
+        out = []
+        for i, n in enumerate(self._dyn_len_host):
+            for s in range(0, max(n, 1), self.span):
+                out.append((i, s))
+        return out
+
+    def eval_batches(self, batch_size: int) -> EvalBatches:
+        return EvalBatches(self, batch_size)
+
+
+class EvalBatches:
+    """Re-iterable deterministic evaluation batches of a ``GPUWindowBatcher``."""
+
+    def __init__(self, batcher: GPUWindowBatcher, batch_size: int) -> None:
+        self.batcher = batcher
+        self.batch_size = batch_size
+        w = torch.tensor(batcher.eval_windows(), dtype=torch.long)
+        self.case, self.start = w[:, 0].to(batcher.device), w[:, 1].to(batcher.device)
+
+    def __len__(self) -> int:
+        return -(-len(self.case) // self.batch_size)
+
+    @property
+    def num_windows(self) -> int:
+        return len(self.case)
+
+    def __iter__(self):
+        for i in range(0, len(self.case), self.batch_size):
+            sl = slice(i, i + self.batch_size)
+            yield self.batcher._gather(self.case[sl], self.start[sl])

@@ -212,3 +212,52 @@ def test_span_mask_rules():
     per_seq_fields = [torch.unique(batch["field_id"][i][m[i]]).numel() for i in range(len(m))]
     n_spans = 2  # ceil(0.3 * 40 / 6)
     assert max(per_seq_fields) <= n_spans  # one field per span
+
+
+def test_nearest_values_and_decode():
+    from carmen_numeric.evaluate import decode, nearest_values
+
+    raw = torch.tensor([[[10.0], [float("nan")], [0.0], [0.0], [50.0]]])  # (1, 5, 1)
+    fid = torch.ones(1, 5, 1, dtype=torch.long)
+    vis = torch.tensor([[[True], [False], [False], [False], [True]]])
+    t = torch.tensor([1, 2, 3])
+    v = nearest_values(raw, fid, vis, 1, torch.zeros(3, dtype=torch.long), t)
+    assert v.tolist() == [10.0, 10.0, 50.0]  # tie at t=2 goes to the earlier row
+    none = nearest_values(raw, fid, torch.zeros_like(vis), 1, torch.zeros(1, dtype=torch.long),
+                          torch.tensor([2]))
+    assert torch.isnan(none).all()
+
+    centers = torch.tensor([90.0, 95.0, 99.0, 100.0])
+    prob = torch.tensor([[0.3, 0.0, 0.2, 0.5]])  # skewed: mass at 100 plus a tail at 90
+    d = decode(prob, centers)
+    assert d["mode"].item() == 100.0 and d["pmedian"].item() == 99.0
+    assert abs(d["mean"].item() - 96.8) < 1e-4
+
+
+def test_device_eval_windows_cover_every_row_once():
+    from carmen_numeric.data.dataset import GPUWindowBatcher
+    from carmen_numeric.evaluate import combine, evaluate
+
+    s = toy_schema()
+    cases = toy_cases(s, n_rows=37)
+    norm = toy_normalizer(s, cases)
+    dev = torch.device("cpu")
+    bt = GPUWindowBatcher(cases, norm, max_rows=16, context_types=(1,), device=dev, keep_raw=True)
+    ds = WindowDataset(cases, norm, max_rows=16, random_crop=False)
+    it = bt.eval_batches(5)
+    assert it.num_windows == len(ds)
+    n_dyn = sum(int((b["row_type"] == 2).sum()) for b in it)
+    assert n_dyn == sum(int((c["row_type"] == 2).sum()) for c in cases.values())
+    first = next(iter(it))
+    ref = collate([ds[i] for i in range(5)])
+    for k in ("row_type", "field_id", "cat_value", "missing", "target"):
+        assert torch.equal(first[k], ref[k][:, : first[k].shape[1]])
+    assert torch.allclose(first["raw"], ref["raw"][:, : first["raw"].shape[1]], equal_nan=True)
+
+    model = toy_model(s, norm)
+    r1 = evaluate(model, it, norm, dev, context_row_types=(1,), point_decode={"a": "pmedian"})
+    assert r1["mae"]["a"]["decode"] == "pmedian" and r1["mae"]["b"]["decode"] == "mean"
+    assert r1["windows"] == len(ds)
+    both = combine([r1, r1])
+    assert both["mae"]["a"]["n"] == 2 * r1["mae"]["a"]["n"]
+    assert abs(both["mae"]["a"]["model"] - r1["mae"]["a"]["model"]) < 1e-9

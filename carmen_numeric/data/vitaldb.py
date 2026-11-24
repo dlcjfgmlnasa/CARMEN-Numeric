@@ -119,6 +119,12 @@ def vitaldb_schema() -> TableSchema:
     return TableSchema(fields=fields, row_types=row_types)
 
 
+# How masked values are turned back into a point estimate for MAE (evaluate.decode).
+# Default is the expectation; SpO2 and MAC pile up at one end of their range (100 %, 0),
+# where the expectation is pulled off the bulk, so they use the predictive median.
+POINT_DECODE: dict[str, str] = {"spo2": "pmedian", "mac": "pmedian"}
+
+
 def vitaldb_cat_sizes() -> dict[str, int]:
     return {k: len(v) for k, v in STATIC_CAT.items()}
 

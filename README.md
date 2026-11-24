@@ -92,6 +92,16 @@ python scripts/orch/orchctl.py runfile --raw scripts/orch/node_pretrain.sh   # S
 python scripts/orch/orchctl.py down
 ```
 
+Score checkpoints on all of VitalDB (train/val/test separately, then pooled; train is
+in-sample) with `STEP=eval SPLIT=all CKPTS="runs/<run>/best.pt ..."`, or directly:
+
+```bash
+python scripts/eval_ckpt.py --data <cache> --split all runs/<run>/best.pt
+```
+
+Point estimates are the predictive expectation, except SpO2 and MAC (`POINT_DECODE`),
+whose values pile up at one end of the range and use the predictive median.
+
 Since the 2026-11 service move `$ORCH_HOME` is unset inside sessions; the script falls
 back to the account's old path, which holds `vitaldb/raw/*.vital`,
 `aki/csv/{clinical,lab}_data.csv` and `venvs/carmen` (torch 2.11 + cu130). The node has
