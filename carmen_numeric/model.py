@@ -330,6 +330,73 @@ def sample_mask(
     return m & can
 
 
+@dataclass
+class SpanMaskConfig:
+    """Contiguous-span masking, added on top of the UniTTab masks (not in the paper).
+
+    Minute-level vitals change slowly, so a value hidden alone is recovered by copying
+    its neighbors; hiding a whole stretch forces the model to infer it from the other
+    variables and from longer context.
+
+    p:               expected fraction of dynamic rows covered by spans (0 disables).
+    min_len/max_len: span length in rows (uniform).
+    field_prob:      probability that a span hides a single field (a variable-level gap,
+                     e.g. the arterial line for 20 minutes) instead of every field.
+    keep_time:       leave the time fields of spanned rows visible (the model knows
+                     *when* it has to fill in).
+    """
+
+    p: float = 0.0
+    min_len: int = 5
+    max_len: int = 30
+    field_prob: float = 0.5
+    keep_time: bool = True
+
+
+def sample_span_mask(
+    batch: dict[str, torch.Tensor],
+    is_time_field: torch.Tensor,  # (F+1,) bool lookup
+    cfg: SpanMaskConfig,
+    context_row_types: torch.Tensor | None = None,  # row types never spanned (static)
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """``(B, T, K)`` bool mask of row spans / single-field spans over the dynamic rows."""
+    fid = batch["field_id"]
+    row_type = batch["row_type"]
+    b, t, _ = fid.shape
+    dev = fid.device
+    if cfg.p <= 0:
+        return torch.zeros_like(fid, dtype=torch.bool)
+    dyn = row_type > 0
+    if context_row_types is not None and context_row_types.numel():
+        dyn &= ~torch.isin(row_type, context_row_types.to(dev))
+    is_time = is_time_field.to(dev)[fid]
+    n_spans = max(1, math.ceil(cfg.p * t / (0.5 * (cfg.min_len + cfg.max_len))))
+    # span starts among the dynamic rows of each sequence
+    n_dyn = dyn.sum(1, keepdim=True).clamp(min=1)  # (B, 1)
+    first = torch.argmax(dyn.int(), dim=1, keepdim=True)  # first dynamic row
+    u = torch.rand(b, n_spans, generator=generator, device=dev)
+    start = first + (u * n_dyn).long()  # (B, S)
+    length = torch.randint(cfg.min_len, cfg.max_len + 1, (b, n_spans),
+                           generator=generator, device=dev)
+    rows = torch.arange(t, device=dev)[None, None]  # (1, 1, T)
+    in_span = (rows >= start[..., None]) & (rows < (start + length)[..., None])
+    in_span &= dyn[:, None, :]  # (B, S, T)
+    # a field span hides one field id, drawn from the values present in the window
+    observed = (fid > 0) & ~batch["missing"] & dyn[..., None] & ~is_time
+    flat = observed.flatten(1).float()  # (B, T*K)
+    flat = flat + (flat.sum(1, keepdim=True) == 0).float()  # avoid an all-zero row
+    pick = torch.multinomial(flat, n_spans, replacement=True, generator=generator)
+    span_fid = torch.gather(fid.flatten(1), 1, pick)  # (B, S)
+    is_field_span = torch.rand(b, n_spans, generator=generator, device=dev) < cfg.field_prob
+    hit_field = fid[:, None] == span_fid[..., None, None]  # (B, S, T, K)
+    slot_sel = hit_field | ~is_field_span[..., None, None]
+    m = (in_span[..., None] & slot_sel).any(1)  # (B, T, K)
+    if cfg.keep_time:
+        m &= ~is_time
+    return m & (fid > 0) & ~batch["missing"]
+
+
 def soft_targets(
     target: torch.Tensor, vocab: int, kind: str, eps: float = 0.1, radius: int = 5
 ) -> torch.Tensor:

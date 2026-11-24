@@ -37,6 +37,12 @@ Deliberate choices where the paper is silent or the clinical setting differs:
 * **Artifacts** outside a physically possible `valid_range` become missing; the
   physiological tails (hypotension, desaturation) are kept.
 * Splits are **patient-level** (`subjectid`).
+* **Span masking** (optional, `--span-p`): contiguous stretches of 5–30 rows are hidden,
+  either whole rows or a single field (a variable-level gap such as a missing arterial
+  line). Minute-level vitals are smooth, so isolated masked values are recovered by
+  copying a neighbor; spans make the model infer from other variables and longer
+  context. Every evaluation reports both regimes (UniTTab masks and spans), and
+  `scripts/eval_ckpt.py` re-scores any checkpoint on val/test with both.
 
 ## Layout
 

@@ -35,11 +35,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from carmen_numeric import (  # noqa: E402
     PRESETS,
     Normalizer,
+    SpanMaskConfig,
     TableSchema,
     UniTTab,
     UniTTabConfig,
     masked_token_loss,
     sample_mask,
+    sample_span_mask,
 )
 from carmen_numeric.data.dataset import (  # noqa: E402
     GPUWindowBatcher,
@@ -71,6 +73,13 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--p-row", type=float, default=0.1)
     ap.add_argument("--eps", type=float, default=0.1)
     ap.add_argument("--radius", type=int, default=5)
+    ap.add_argument("--span-p", type=float, default=0.0,
+                    help="span masking: expected fraction of rows in spans (0 = off)")
+    ap.add_argument("--span-min", type=int, default=5)
+    ap.add_argument("--span-max", type=int, default=30)
+    ap.add_argument("--span-field-prob", type=float, default=0.5)
+    ap.add_argument("--span-mask-time", action="store_true",
+                    help="also hide the time fields of spanned rows")
     ap.add_argument("--windows-per-case", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--data-on-device", action="store_true",
@@ -185,6 +194,11 @@ def main() -> None:
     amp_dtype = {"none": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.amp]
     scaler = torch.amp.GradScaler(enabled=args.amp == "fp16")
     is_time = torch.tensor([False] + [f.is_time for f in schema.fields]).to(device)
+    ctx_types = torch.tensor(ctx, dtype=torch.long, device=device)
+    span_cfg = SpanMaskConfig(args.span_p, args.span_min, args.span_max, args.span_field_prob,
+                              keep_time=not args.span_mask_time)
+    # fixed gap-filling regime for evaluation, the same for every run
+    eval_span = SpanMaskConfig(0.2, 5, 30, 0.5, keep_time=True)
 
     if is_main:
         print(f"device={device} world={world} params={n_params / 1e6:.2f}M "
@@ -206,6 +220,8 @@ def main() -> None:
     while step < args.steps:
         b = next(batches)
         masked = sample_mask(b, is_time, args.p_field, args.p_row, generator=mask_gen)
+        if span_cfg.p > 0:
+            masked |= sample_span_mask(b, is_time, span_cfg, ctx_types, generator=mask_gen)
         for g in opt.param_groups:
             g["lr"] = lr_at(step, args)
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
@@ -237,10 +253,18 @@ def main() -> None:
                 ev = evaluate(model, val_dl, norm, device, args.p_field, args.p_row,
                               args.eps, args.radius, max_batches=args.eval_batches,
                               amp_dtype=amp_dtype)
+                ev_span = evaluate(model, val_dl, norm, device, eps=args.eps,
+                                   radius=args.radius, max_batches=args.eval_batches,
+                                   amp_dtype=amp_dtype, span=eval_span, context_row_types=ctx)
                 head = {k: ev[k] for k in ("loss", "acc_num", "acc_num_pm2", "acc_cat")}
+                head["span_loss"] = ev_span["loss"]
                 print(f"[eval step {step}] {json.dumps(head)}")
-                print(summarize_mae(ev["mae"], KEY_FIELDS), flush=True)
-                log_f.write(json.dumps({"split": "val", "step": step, **ev}) + "\n")
+                print("  masks: UniTTab (field/row)")
+                print(summarize_mae(ev["mae"], KEY_FIELDS))
+                print("  masks: spans (gap filling)")
+                print(summarize_mae(ev_span["mae"], KEY_FIELDS), flush=True)
+                log_f.write(json.dumps({"split": "val", "step": step, **ev,
+                                        "span": ev_span}) + "\n")
                 log_f.flush()
                 if ev["loss"] < best:
                     best = ev["loss"]

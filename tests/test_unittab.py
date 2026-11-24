@@ -186,3 +186,29 @@ def test_gpu_batcher_matches_rows():
     m = sample_mask(b, is_time, generator=torch.Generator().manual_seed(2))
     loss, _ = masked_token_loss(model(b, m)["predictions"], model.cfg.field_kinds)
     assert torch.isfinite(loss)
+
+
+def test_span_mask_rules():
+    from carmen_numeric import SpanMaskConfig, sample_span_mask
+
+    s = toy_schema()
+    _, batch = _batch(s, max_rows=40)
+    is_time = torch.tensor([False] + [f.is_time for f in s.fields])
+    cfg = SpanMaskConfig(p=0.3, min_len=4, max_len=8, field_prob=0.0, keep_time=True)
+    m = sample_span_mask(batch, is_time, cfg, torch.tensor([1]),
+                         generator=torch.Generator().manual_seed(0))
+    assert m.any()
+    assert not m[:, 0].any()  # the static (context) row is never spanned
+    assert not (m & is_time[batch["field_id"]]).any()  # time stays visible
+    assert not (m & batch["missing"]).any()
+    # row spans: a spanned row hides every observed non-time value of the row
+    rows = m.any(-1)
+    vis = (batch["field_id"] > 0) & ~batch["missing"] & ~is_time[batch["field_id"]]
+    assert ((m == vis) | ~rows[..., None]).all()
+
+    cfg = SpanMaskConfig(p=0.3, min_len=4, max_len=8, field_prob=1.0, keep_time=True)
+    m = sample_span_mask(batch, is_time, cfg, torch.tensor([1]),
+                         generator=torch.Generator().manual_seed(1))
+    per_seq_fields = [torch.unique(batch["field_id"][i][m[i]]).numel() for i in range(len(m))]
+    n_spans = 2  # ceil(0.3 * 40 / 6)
+    assert max(per_seq_fields) <= n_spans  # one field per span

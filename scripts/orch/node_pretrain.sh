@@ -17,7 +17,7 @@ set -euo pipefail
 STEP="${STEP:-code}"
 BASE="${ORCH_HOME:-/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd}"
 ROOT="${ROOT:-$BASE/carmen_numeric}"
-CODE="$ROOT/code"
+CODE="${CODE:-$ROOT/code}"
 BRANCH="${BRANCH:-main}"
 PY="${PY:-$BASE/venvs/carmen/bin/python}"   # torch 2.11 + cu130, numpy, pandas, vitaldb
 DATA="${DATA:-$ROOT/data/vitaldb}"
@@ -30,6 +30,7 @@ STEPS="${STEPS:-30000}"
 BATCH="${BATCH:-128}"
 LR="${LR:-2e-4}"
 RUN="${RUN:-unittab_${PRESET}_$(date +%Y%m%d_%H%M)}"
+EXTRA="${EXTRA:-}"   # extra pretrain.py flags, e.g. "--span-p 0.2"
 # HOME is the per-session workspace; keep caches with the persistent files
 export XDG_CACHE_HOME="$BASE/.cache" PIP_CACHE_DIR="$BASE/.cache/pip" TORCH_HOME="$BASE/.cache/torch"
 
@@ -57,7 +58,7 @@ train)
   echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
   NGPU=$("$PY" -c "import torch; print(max(torch.cuda.device_count(), 1))")
   LOG="$ROOT/runs/$RUN.log"
-  echo "[train] run=$RUN preset=$PRESET steps=$STEPS gpus=$NGPU batch/gpu=$BATCH"
+  echo "[train] run=$RUN preset=$PRESET steps=$STEPS gpus=$NGPU batch/gpu=$BATCH extra=$EXTRA"
   if [ "$NGPU" -gt 1 ]; then
     LAUNCH=("$PY" -m torch.distributed.run --standalone --nproc_per_node "$NGPU")
   else
@@ -66,7 +67,7 @@ train)
   ( cd "$CODE" && setsid nohup "${LAUNCH[@]}" scripts/pretrain.py --data "$DATA" \
       --out "$ROOT/runs/$RUN" --preset "$PRESET" --steps "$STEPS" --batch-size "$BATCH" \
       --lr "$LR" --amp bf16 --data-on-device --workers 2 --cpu-threads 4 \
-      --eval-every 2000 --eval-batches 400 \
+      --eval-every 2000 --eval-batches 400 $EXTRA \
       > "$LOG" 2>&1 < /dev/null & )
   echo "started; log: $LOG"
   ;;

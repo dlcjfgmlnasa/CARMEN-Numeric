@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from .data.dataset import to_device
-from .model import UniTTab, masked_token_loss, sample_mask
+from .model import SpanMaskConfig, UniTTab, masked_token_loss, sample_mask, sample_span_mask
 from .normalize import Normalizer
 
 
@@ -59,8 +59,15 @@ def evaluate(
     seed: int = 1234,
     max_batches: int | None = None,
     amp_dtype: torch.dtype | None = None,
+    span: SpanMaskConfig | None = None,
+    context_row_types: tuple[int, ...] = (),
 ) -> dict:
-    """Loss, accuracies and per-field MAE (model vs. baselines) on a fixed masking."""
+    """Loss, accuracies and per-field MAE (model vs. baselines) on a fixed masking.
+
+    ``span=None`` evaluates the UniTTab masks (``p_field``, ``p_row``); with a
+    ``SpanMaskConfig`` only span masks are used — the gap-filling regime, where the
+    nearest-value baseline has to bridge whole stretches.
+    """
     model.eval()
     schema = normalizer.schema
     is_time = torch.tensor([False] + [f.is_time for f in schema.fields])
@@ -71,7 +78,11 @@ def evaluate(
     for i, batch in enumerate(loader):
         if max_batches is not None and i >= max_batches:
             break
-        masked = sample_mask(batch, is_time, p_field, p_row, generator=gen)
+        if span is None:
+            masked = sample_mask(batch, is_time, p_field, p_row, generator=gen)
+        else:
+            masked = sample_span_mask(batch, is_time, span, torch.tensor(context_row_types),
+                                      generator=gen)
         if not masked.any():
             continue
         dev_batch = to_device(batch, device)
