@@ -95,7 +95,9 @@ python scripts/orch/orchctl.py down
 Since the 2026-11 service move `$ORCH_HOME` is unset inside sessions; the script falls
 back to the account's old path, which holds `vitaldb/raw/*.vital`,
 `aki/csv/{clinical,lab}_data.csv` and `venvs/carmen` (torch 2.11 + cu130). The node has
-no git, so code comes in as the GitHub branch tarball. Patient data stays on the node.
+no git, so code comes in as the GitHub branch tarball. Everything of this repo lives in
+`carmen_numeric_unittab/` (the neighbouring `carmen_numeric/` is a different project).
+Patient data stays on the node.
 
 ## Next
 

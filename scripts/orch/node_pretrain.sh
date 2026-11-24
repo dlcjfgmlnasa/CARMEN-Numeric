@@ -16,7 +16,7 @@ set -euo pipefail
 
 STEP="${STEP:-code}"
 BASE="${ORCH_HOME:-/NHNHOME/orch-data/users/fd0cc5e8e1e24c9da69dbc8c15330cdd}"
-ROOT="${ROOT:-$BASE/carmen_numeric}"
+ROOT="${ROOT:-$BASE/carmen_numeric_unittab}"  # not carmen_numeric: another project lives there
 CODE="${CODE:-$ROOT/code}"
 BRANCH="${BRANCH:-main}"
 PY="${PY:-$BASE/venvs/carmen/bin/python}"   # torch 2.11 + cu130, numpy, pandas, vitaldb
