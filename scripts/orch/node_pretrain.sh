@@ -65,7 +65,8 @@ train)
   fi
   ( cd "$CODE" && setsid nohup "${LAUNCH[@]}" scripts/pretrain.py --data "$DATA" \
       --out "$ROOT/runs/$RUN" --preset "$PRESET" --steps "$STEPS" --batch-size "$BATCH" \
-      --lr "$LR" --amp bf16 --workers 8 --eval-every 2000 --eval-batches 400 \
+      --lr "$LR" --amp bf16 --data-on-device --workers 2 --cpu-threads 4 \
+      --eval-every 2000 --eval-batches 400 \
       > "$LOG" 2>&1 < /dev/null & )
   echo "started; log: $LOG"
   ;;

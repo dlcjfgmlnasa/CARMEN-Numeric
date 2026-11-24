@@ -162,3 +162,87 @@ def collect_field_values(
             x = rng.choice(x, max_per_field, replace=False)
         out[fid] = x
     return out
+
+
+class GPUWindowBatcher:
+    """Training batches sampled entirely on the device (no DataLoader workers).
+
+    All rows of all cases are transformed once and kept on ``device`` (a few hundred MB
+    for the whole of VitalDB); each call draws random cases and a random window of their
+    dynamic rows by index arithmetic. Use it when the host CPU is the bottleneck (e.g. a
+    shared node). Context rows (``context_types``) must be the first rows of each case,
+    as ``data.vitaldb.build_case`` writes them.
+    """
+
+    def __init__(
+        self,
+        cases: dict[int, dict],
+        normalizer: Normalizer,
+        max_rows: int,
+        context_types: tuple[int, ...],
+        device: torch.device,
+    ) -> None:
+        parts: dict[str, list[np.ndarray]] = {k: [] for k in
+                                              ("field_id", "num_value", "cat_value", "missing",
+                                               "target", "row_type")}
+        n_ctx, dyn_start, dyn_len, ctx_start = [], [], [], []
+        offset = 0
+        for cid in sorted(cases):
+            c = cases[cid]
+            rt = c["row_type"]
+            ctx = np.isin(rt, np.asarray(context_types))
+            k = int(ctx.sum())
+            if k and not ctx[:k].all():
+                raise ValueError(f"case {cid}: context rows must come first")
+            tr = normalizer.transform(c["values"], rt)
+            for key in ("field_id", "num_value", "cat_value", "missing", "target"):
+                parts[key].append(tr[key])
+            parts["row_type"].append(rt)
+            n_ctx.append(k)
+            ctx_start.append(offset)
+            dyn_start.append(offset + k)
+            dyn_len.append(len(rt) - k)
+            offset += len(rt)
+        cat = {k: np.concatenate(v) for k, v in parts.items()}
+        dt = {"field_id": torch.int16, "cat_value": torch.int16, "target": torch.int16,
+              "row_type": torch.int8, "num_value": torch.float32, "missing": torch.bool}
+        self.rows = {k: torch.as_tensor(v).to(device=device, dtype=dt[k]) for k, v in cat.items()}
+        self.n_ctx = torch.tensor(n_ctx, device=device)
+        self.ctx_start = torch.tensor(ctx_start, device=device)
+        self.dyn_start = torch.tensor(dyn_start, device=device)
+        self.dyn_len = torch.tensor(dyn_len, device=device)
+        self.max_ctx = int(max(n_ctx))
+        self.span = max_rows - self.max_ctx
+        self.device = device
+        self.num_cases = len(n_ctx)
+
+    def sample(self, batch_size: int, generator: torch.Generator) -> dict[str, torch.Tensor]:
+        dev = self.device
+        case = torch.randint(self.num_cases, (batch_size,), device=dev, generator=generator)
+        length = self.dyn_len[case]
+        take = length.clamp(max=self.span)
+        room = (length - take + 1).float()
+        start = (torch.rand(batch_size, device=dev, generator=generator) * room).long()
+        t_dyn = int(take.max())
+        ar = torch.arange(t_dyn, device=dev)
+        dyn_idx = self.dyn_start[case, None] + start[:, None] + ar  # (B, t_dyn)
+        dyn_ok = ar < take[:, None]
+        if self.max_ctx:
+            ac = torch.arange(self.max_ctx, device=dev)
+            ctx_idx = self.ctx_start[case, None] + ac
+            ctx_ok = ac < self.n_ctx[case, None]
+            idx = torch.cat([ctx_idx, dyn_idx], 1)
+            ok = torch.cat([ctx_ok, dyn_ok], 1)
+        else:
+            idx, ok = dyn_idx, dyn_ok
+        idx = torch.where(ok, idx, 0)
+        okk = ok.unsqueeze(-1)
+        r = self.rows
+        return {
+            "row_type": torch.where(ok, r["row_type"][idx].long(), 0),
+            "field_id": torch.where(okk, r["field_id"][idx].long(), 0),
+            "num_value": torch.where(okk, r["num_value"][idx], 0.0),
+            "cat_value": torch.where(okk, r["cat_value"][idx].long(), 0),
+            "missing": r["missing"][idx] & okk,
+            "target": torch.where(okk, r["target"][idx].long(), -1),
+        }

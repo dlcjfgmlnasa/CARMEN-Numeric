@@ -374,7 +374,8 @@ def masked_token_loss(
     """
     total = None
     n_total = 0
-    stats = {"n_num": 0, "n_cat": 0, "acc_num": 0.0, "acc_num_pm2": 0.0, "acc_cat": 0.0}
+    hits = {"num": [], "num_pm2": [], "cat": []}
+    counts = {"num": 0, "cat": 0}
     for pr in predictions:
         fid, logits, target = pr.field_id, pr.logits, pr.target
         kind = field_kinds[fid]
@@ -384,17 +385,25 @@ def masked_token_loss(
         total = loss if total is None else total + loss
         n = target.numel()
         n_total += n
-        with torch.no_grad():
+        with torch.no_grad():  # kept as tensors: one host sync at the end, not one per field
             hit = logits.argmax(-1)
             if kind == "num":
-                stats["n_num"] += n
-                stats["acc_num"] += (hit == target).sum().item()
-                stats["acc_num_pm2"] += ((hit - target).abs() <= 2).sum().item()
+                counts["num"] += n
+                hits["num"].append((hit == target).sum())
+                hits["num_pm2"].append(((hit - target).abs() <= 2).sum())
             else:
-                stats["n_cat"] += n
-                stats["acc_cat"] += (hit == target).sum().item()
+                counts["cat"] += n
+                hits["cat"].append((hit == target).sum())
     if total is None:
         raise ValueError("nothing was masked in this batch")
-    for k, n in (("acc_num", "n_num"), ("acc_num_pm2", "n_num"), ("acc_cat", "n_cat")):
-        stats[k] = stats[k] / max(stats[n], 1)
+    keys = [k for k in hits if hits[k]]
+    vals = torch.stack([torch.stack(hits[k]).sum() for k in keys]).tolist() if keys else []
+    got = dict(zip(keys, vals, strict=True))
+    stats = {
+        "n_num": counts["num"],
+        "n_cat": counts["cat"],
+        "acc_num": got.get("num", 0) / max(counts["num"], 1),
+        "acc_num_pm2": got.get("num_pm2", 0) / max(counts["num"], 1),
+        "acc_cat": got.get("cat", 0) / max(counts["cat"], 1),
+    }
     return total / n_total, stats

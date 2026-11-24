@@ -41,7 +41,13 @@ from carmen_numeric import (  # noqa: E402
     masked_token_loss,
     sample_mask,
 )
-from carmen_numeric.data.dataset import WindowDataset, collate, load_cases, to_device  # noqa: E402
+from carmen_numeric.data.dataset import (  # noqa: E402
+    GPUWindowBatcher,
+    WindowDataset,
+    collate,
+    load_cases,
+    to_device,
+)
 from carmen_numeric.evaluate import evaluate, summarize_mae  # noqa: E402
 
 KEY_FIELDS = ["hr", "spo2", "art_mbp", "nibp_mbp", "etco2", "bis", "bt", "ppf_ce", "lab_k",
@@ -67,6 +73,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--radius", type=int, default=5)
     ap.add_argument("--windows-per-case", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--data-on-device", action="store_true",
+                    help="keep all training rows on the GPU and sample windows there "
+                         "(no DataLoader workers; for CPU-starved shared nodes)")
+    ap.add_argument("--cpu-threads", type=int, default=4, help="torch intra-op threads")
     ap.add_argument("--amp", default="none", choices=["none", "bf16", "fp16"])
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--eval-every", type=int, default=1000)
@@ -104,6 +114,7 @@ def main() -> None:
     args = parse_args()
     rank, world, device = setup_dist()
     is_main = rank == 0
+    torch.set_num_threads(args.cpu_threads)
     torch.manual_seed(args.seed + rank)
     out = Path(args.out)
     if is_main:
@@ -118,16 +129,36 @@ def main() -> None:
 
     train_cases = load_cases(data, split["train"])
     val_cases = load_cases(data, split["val"])
-    train_ds = WindowDataset(train_cases, norm, args.max_rows, ctx, random_crop=True,
-                             windows_per_case=args.windows_per_case, seed=args.seed + rank)
     val_ds = WindowDataset(val_cases, norm, args.max_rows, ctx, random_crop=False)
-    sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed) if world > 1 else None
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=sampler is None,
-                          sampler=sampler, num_workers=args.workers, collate_fn=collate,
-                          worker_init_fn=worker_init if args.workers else None, drop_last=True,
-                          pin_memory=device.type == "cuda", persistent_workers=False)
     val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.workers, collate_fn=collate)
+                        num_workers=min(args.workers, 2), collate_fn=collate)
+    mask_gen = torch.Generator(device=device).manual_seed(args.seed * 1000 + rank)
+    if args.data_on_device:
+        batcher = GPUWindowBatcher(train_cases, norm, args.max_rows, ctx, device)
+        n_train = f"{batcher.num_cases} cases on {device}"
+
+        def train_batches():
+            while True:
+                yield batcher.sample(args.batch_size, mask_gen)
+    else:
+        train_ds = WindowDataset(train_cases, norm, args.max_rows, ctx, random_crop=True,
+                                 windows_per_case=args.windows_per_case, seed=args.seed + rank)
+        sampler = DistributedSampler(train_ds, shuffle=True, seed=args.seed) if world > 1 \
+            else None
+        train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=sampler is None,
+                              sampler=sampler, num_workers=args.workers, collate_fn=collate,
+                              worker_init_fn=worker_init if args.workers else None,
+                              drop_last=True, pin_memory=device.type == "cuda")
+        n_train = f"{len(train_ds)} windows/epoch"
+
+        def train_batches():
+            epoch = 0
+            while True:
+                if sampler is not None:
+                    sampler.set_epoch(epoch)
+                for b in train_dl:
+                    yield to_device(b, device)
+                epoch += 1
 
     cfg = UniTTabConfig.from_schema(schema, norm, max_rows=args.max_rows, dropout=args.dropout,
                                     **PRESETS[args.preset])
@@ -153,12 +184,11 @@ def main() -> None:
         if world > 1 else model
     amp_dtype = {"none": None, "bf16": torch.bfloat16, "fp16": torch.float16}[args.amp]
     scaler = torch.amp.GradScaler(enabled=args.amp == "fp16")
-    is_time = torch.tensor([False] + [f.is_time for f in schema.fields])
-    gen = torch.Generator().manual_seed(args.seed * 1000 + rank)
+    is_time = torch.tensor([False] + [f.is_time for f in schema.fields]).to(device)
 
     if is_main:
         print(f"device={device} world={world} params={n_params / 1e6:.2f}M "
-              f"train windows/epoch={len(train_ds)} val windows={len(val_ds)} "
+              f"train={n_train} val windows={len(val_ds)} "
               f"cases train/val={len(train_cases)}/{len(val_cases)}", flush=True)
     log_f = open(out / "log.jsonl", "a") if is_main else None
 
@@ -172,60 +202,52 @@ def main() -> None:
     model.train()
     t0 = time.time()
     run = {"loss": 0.0, "acc_num": 0.0, "acc_cat": 0.0, "n": 0}
-    epoch = 0
+    batches = train_batches()
     while step < args.steps:
-        if sampler is not None:
-            sampler.set_epoch(epoch)
-        for batch in train_dl:
-            if step >= args.steps:
-                break
-            masked = sample_mask(batch, is_time, args.p_field, args.p_row, generator=gen)
-            if not masked.any():
-                continue
-            for g in opt.param_groups:
-                g["lr"] = lr_at(step, args)
-            b = to_device(batch, device)
-            with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                res = ddp(b, masked.to(device))
-            loss, st = masked_token_loss(res["predictions"], cfg.field_kinds, args.eps, args.radius)
-            opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(opt)
-            scaler.update()
-            step += 1
-            run["loss"] += loss.item()
-            run["acc_num"] += st["acc_num"]
-            run["acc_cat"] += st["acc_cat"]
-            run["n"] += 1
+        b = next(batches)
+        masked = sample_mask(b, is_time, args.p_field, args.p_row, generator=mask_gen)
+        for g in opt.param_groups:
+            g["lr"] = lr_at(step, args)
+        with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            res = ddp(b, masked)
+        loss, st = masked_token_loss(res["predictions"], cfg.field_kinds, args.eps, args.radius)
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt)
+        scaler.update()
+        step += 1
+        run["loss"] += loss.item()
+        run["acc_num"] += st["acc_num"]
+        run["acc_cat"] += st["acc_cat"]
+        run["n"] += 1
 
-            if is_main and step % args.log_every == 0:
-                rec = {"step": step, "lr": lr_at(step, args), "gnorm": float(gnorm),
-                       "sec": round(time.time() - t0, 1),
-                       **{k: run[k] / run["n"] for k in ("loss", "acc_num", "acc_cat")}}
-                print(json.dumps(rec), flush=True)
-                log_f.write(json.dumps({"split": "train", **rec}) + "\n")
+        if is_main and step % args.log_every == 0:
+            rec = {"step": step, "lr": lr_at(step, args), "gnorm": float(gnorm),
+                   "sec": round(time.time() - t0, 1),
+                   **{k: run[k] / run["n"] for k in ("loss", "acc_num", "acc_cat")}}
+            print(json.dumps(rec), flush=True)
+            log_f.write(json.dumps({"split": "train", **rec}) + "\n")
+            log_f.flush()
+            run = {"loss": 0.0, "acc_num": 0.0, "acc_cat": 0.0, "n": 0}
+
+        if step % args.eval_every == 0 or step == args.steps:
+            if is_main:
+                ev = evaluate(model, val_dl, norm, device, args.p_field, args.p_row,
+                              args.eps, args.radius, max_batches=args.eval_batches,
+                              amp_dtype=amp_dtype)
+                head = {k: ev[k] for k in ("loss", "acc_num", "acc_num_pm2", "acc_cat")}
+                print(f"[eval step {step}] {json.dumps(head)}")
+                print(summarize_mae(ev["mae"], KEY_FIELDS), flush=True)
+                log_f.write(json.dumps({"split": "val", "step": step, **ev}) + "\n")
                 log_f.flush()
-                run = {"loss": 0.0, "acc_num": 0.0, "acc_cat": 0.0, "n": 0}
-
-            if step % args.eval_every == 0 or step == args.steps:
-                if is_main:
-                    ev = evaluate(model, val_dl, norm, device, args.p_field, args.p_row,
-                                  args.eps, args.radius, max_batches=args.eval_batches,
-                                  amp_dtype=amp_dtype)
-                    head = {k: ev[k] for k in ("loss", "acc_num", "acc_num_pm2", "acc_cat")}
-                    print(f"[eval step {step}] {json.dumps(head)}")
-                    print(summarize_mae(ev["mae"], KEY_FIELDS), flush=True)
-                    log_f.write(json.dumps({"split": "val", "step": step, **ev}) + "\n")
-                    log_f.flush()
-                    if ev["loss"] < best:
-                        best = ev["loss"]
-                        save("best", {"val": head})
-                    save("last", {"val": head})
-                if world > 1:
-                    dist.barrier()
-        epoch += 1
+                if ev["loss"] < best:
+                    best = ev["loss"]
+                    save("best", {"val": head})
+                save("last", {"val": head})
+            if world > 1:
+                dist.barrier()
 
     if is_main:
         log_f.close()

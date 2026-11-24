@@ -165,3 +165,24 @@ def test_masked_values_do_not_leak():
         a = model(batch, m)["rows"]
         b = model(b2, m)["rows"]
     assert torch.allclose(a, b)
+
+
+def test_gpu_batcher_matches_rows():
+    from carmen_numeric.data.dataset import GPUWindowBatcher
+
+    s = toy_schema()
+    cases = toy_cases(s, n_rows=40)
+    norm = toy_normalizer(s, cases)
+    bt = GPUWindowBatcher(cases, norm, max_rows=16, context_types=(1,), device=torch.device("cpu"))
+    b = bt.sample(8, torch.Generator().manual_seed(0))
+    assert b["row_type"].shape == (8, 16)
+    assert (b["row_type"][:, 0] == 1).all() and (b["row_type"][:, 1:] == 2).all()
+    # time field of the dynamic rows is contiguous inside each window
+    t_slot = b["num_value"][:, 1:, 0]
+    d = torch.diff(t_slot, dim=1)
+    assert torch.allclose(d, d[:, :1].expand_as(d), atol=1e-5)
+    model = toy_model(s, norm)
+    is_time = torch.tensor([False] + [f.is_time for f in s.fields])
+    m = sample_mask(b, is_time, generator=torch.Generator().manual_seed(2))
+    loss, _ = masked_token_loss(model(b, m)["predictions"], model.cfg.field_kinds)
+    assert torch.isfinite(loss)
