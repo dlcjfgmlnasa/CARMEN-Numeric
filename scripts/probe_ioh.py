@@ -206,7 +206,10 @@ def bootstrap(y: np.ndarray, s: np.ndarray, groups: np.ndarray, n: int = 200,
     return {"auroc": auroc(y, s), "auroc_ci": q(roc), "auprc": auprc(y, s), "auprc_ci": q(pr)}
 
 
-def linear_probe(xtr, ytr, xva, yva, xte, device, epochs: int = 30) -> tuple[np.ndarray, dict]:
+def linear_probe(xtr, ytr, xva, yva, xte, device, epochs: int = 30,
+                 return_model: bool = False) -> tuple[np.ndarray, dict]:
+    """Logistic regression on standardized features; returns test logits and the val pick
+    (with ``return_model`` also ``weight``, ``bias``, ``mu``, ``sd`` of the picked probe)."""
     mu, sd = xtr.mean(0), xtr.std(0) + 1e-6
     t = lambda x: torch.as_tensor((x - mu) / sd, dtype=torch.float32, device=device)  # noqa: E731
     xtr_t, xva_t, xte_t = t(xtr), t(xva), t(xte)
@@ -231,6 +234,9 @@ def linear_probe(xtr, ytr, xva, yva, xte, device, epochs: int = 30) -> tuple[np.
                 with torch.no_grad():
                     best = {"auroc": a, "wd": wd, "epoch": ep + 1,
                             "test": lin(xte_t).squeeze(-1).cpu().numpy()}
+                    if return_model:
+                        best.update(weight=lin.weight[0].cpu().numpy().copy(),
+                                    bias=float(lin.bias[0]), mu=mu, sd=sd)
     return best.pop("test"), best
 
 
