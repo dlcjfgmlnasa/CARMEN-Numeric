@@ -17,7 +17,9 @@ queries and no numeric encoder. ``late``: the numeric features concatenated with
 waveform tokens. ``gated``: the numeric MLP head of ``finetune_ioh.py`` plus a residual waveform
 branch (cross-attention blocks + MLP whose last layer starts at zero), so the model starts as the
 numeric-only model; with ``--init-from`` (a ``finetune_ioh.py`` ``best.pt``) it starts from
-that model's weights and the step-0 state competes in checkpoint selection. CARMEN stays
+that model's weights and the step-0 state competes in checkpoint selection, and with
+``--freeze-numeric`` only the waveform branch is trained (the numeric model is kept as is, in
+eval mode, so the checkpoints differ only by the waveform residual). CARMEN stays
 frozen. The step with the best mean val AUROC is kept; test metrics, curves and logits
 (``test_scores.npz``) are written.
 
@@ -199,6 +201,7 @@ class FusionModel(nn.Module):
                  dropout: float = 0.1) -> None:
         super().__init__()
         self.mode = mode
+        self.frozen_numeric = False
         self.encoder = encoder if mode != "wave" else None
         self.wave = WaveTokens(d_carmen, m)
         if mode in ("fusion", "wave", "gated"):
@@ -211,6 +214,20 @@ class FusionModel(nn.Module):
             self.wave_head = self._mlp(3 * m, n_out, dropout)
             nn.init.zeros_(self.wave_head[-1].weight)
             nn.init.zeros_(self.wave_head[-1].bias)
+
+    def freeze_numeric(self) -> None:
+        """Keep the numeric encoder + head fixed (no gradients, eval-mode dropout)."""
+        self.frozen_numeric = True
+        for p in [*self.encoder.parameters(), *self.head.parameters()]:
+            p.requires_grad_(False)
+        self.train(self.training)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.frozen_numeric:
+            self.encoder.eval()
+            self.head.eval()
+        return self
 
     @staticmethod
     def _mlp(width: int, n_out: int, dropout: float) -> nn.Sequential:  # = IOHModel.head
@@ -294,10 +311,14 @@ def main() -> None:
     ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
     ap.add_argument("--init-from", default=None,
                     help="--mode gated: finetune_ioh.py best.pt for the encoder + numeric head")
+    ap.add_argument("--freeze-numeric", action="store_true",
+                    help="--mode gated with --init-from: train only the waveform branch")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.init_from and args.mode != "gated":
         ap.error("--init-from needs --mode gated")
+    if args.freeze_numeric and not args.init_from:
+        ap.error("--freeze-numeric needs --init-from")
 
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
@@ -331,9 +352,12 @@ def main() -> None:
         if unexpected or any(k.startswith(("encoder.", "head.")) for k in missing):
             raise ValueError(f"{args.init_from}: not a finetune_ioh.py model of this size")
         model.to(device)
-    enc_params = list(model.encoder.parameters()) if model.encoder is not None else []
-    enc_ids = {id(p) for p in enc_params}
-    other = [p for p in model.parameters() if id(p) not in enc_ids]
+        if args.freeze_numeric:
+            model.freeze_numeric()
+    enc_params = [p for p in model.encoder.parameters() if p.requires_grad] \
+        if model.encoder is not None else []
+    enc_ids = {id(p) for p in model.encoder.parameters()} if model.encoder is not None else set()
+    other = [p for p in model.parameters() if id(p) not in enc_ids and p.requires_grad]
     groups = [{"params": other, "lr": args.lr_head}]
     if enc_params:
         groups.append({"params": enc_params, "lr": args.lr_enc})
