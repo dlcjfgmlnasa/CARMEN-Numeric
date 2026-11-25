@@ -22,7 +22,9 @@ CARMEN (frozen, ``task="masked"``, any-variate packing: the three signals of a s
 to each other) encodes 240 patches (0.25 s) per signal; patches are mean-pooled into 5 s
 tokens, giving ``(3 signals x 12 chunks, d_model)`` per sample. Writes per split
 ``<split>_tokens.npy`` (float16, ``(n, 36, d)``), ``<split>_valid.npy`` (``(n, 36)``) and
-``<split>_meta.npz`` (caseid, t, presence) in the sample order of ``probe_ioh.build_samples``.
+``<split>_meta.npz`` (caseid, t, presence) in the sample order of the task
+(``downstream_tasks.build_task``; ``--task``). Case-level tasks give 12 windows spread over the
+case per sample; each window becomes one token per signal (slot = signal x window).
 """
 from __future__ import annotations
 
@@ -38,6 +40,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import downstream_tasks as T  # noqa: E402
 import probe_ioh as P  # noqa: E402
 
 from carmen_numeric import TableSchema  # noqa: E402
@@ -227,8 +230,12 @@ class TokenWriter:
     """
 
     def __init__(self, enc: CarmenEncoder, out: Path, outputs: dict[str, tuple[int, ...]],
-                 n: int, batch_size: int) -> None:
-        self.enc, self.out, self.outputs, self.n, self.bs = enc, out, outputs, n, batch_size
+                 n: int, batch_size: int, snap: int = 1) -> None:
+        """``snap`` > 1: every sample has ``snap`` consecutive windows (case-level tasks); each
+        window is pooled to one token per signal and the windows fill the chunk axis."""
+        self.enc, self.out, self.outputs, self.n = enc, out, outputs, n
+        self.snap = snap
+        self.bs = max(snap, batch_size // snap * snap)
         self.tokens: dict[str, np.ndarray] = {}
         self.valid = {k: np.zeros((n, N_SIG * N_CHUNK), bool) for k in outputs}
         self.buf: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
@@ -260,8 +267,22 @@ class TokenWriter:
                 tk, vl = self.enc(w[sl], p[sl] & allow)
                 if tk is None:
                     continue
-                self._memmap(prefix)[ii[sl]] = tk
-                self.valid[prefix][ii[sl]] = vl
+                rows = ii[sl]
+                if self.snap > 1:
+                    tk, vl = self._pool_snapshots(tk, vl)
+                    rows = rows[:: self.snap]
+                self._memmap(prefix)[rows] = tk
+                self.valid[prefix][rows] = vl
+
+    def _pool_snapshots(self, tk: np.ndarray, vl: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(n*K, 36, d), (n*K, 36) -> (n, 36, d), (n, 36): slot = signal * K + window."""
+        k, d = self.snap, tk.shape[-1]
+        t = tk.astype(np.float32).reshape(-1, k, N_SIG, N_CHUNK, d)
+        w = vl.reshape(-1, k, N_SIG, N_CHUNK).astype(np.float32)
+        pooled = (t * w[..., None]).sum(3) / np.maximum(w.sum(3), 1)[..., None]  # (n, K, 3, d)
+        valid = w.sum(3) > 0  # (n, K, 3)
+        return (pooled.transpose(0, 2, 1, 3).reshape(-1, N_SIG * k, d).astype(np.float16),
+                valid.transpose(0, 2, 1).reshape(-1, N_SIG * k))
 
     def close(self) -> None:
         self.flush()
@@ -274,18 +295,24 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
     label_data = Path(args.label_data)
     names = {"ecg": 0, "abp": 1, "ppg": 2}
     keep = tuple(names[k] for k in args.signals)
-    s = P.build_samples(load_cases(label_data, ids), schema, [5, 10, 15], 5, 15.0)
+    s = T.build_task(args.task, load_cases(label_data, ids), schema, args.cases_csv,
+                     args.labs_csv)
     n = len(s["t"])
+    snap = s["wave_t"].shape[1]
+    if snap not in (1, N_CHUNK):
+        raise ValueError(f"{snap} windows per sample; expected 1 or {N_CHUNK}")
     start = {}
     for c in np.unique(s["caseid"]):
         a = clin.anestart.get(c, np.nan)
         start[c] = int(max(0.0, a)) if np.isfinite(a) else 0
-    ends = np.array([start[c] for c in s["caseid"]]) + 60 * (np.floor(s["t"]).astype(int) + 1)
+    # window k of a sample ends where the minute row of wave_t[:, k] ends
+    ends = (np.array([start[c] for c in s["caseid"]])[:, None]
+            + 60 * (np.floor(s["wave_t"]).astype(int) + 1))  # (n, K) seconds
     jobs, offsets, pos = [], [], 0
     for c in np.unique(s["caseid"]):  # build_samples orders samples by caseid
         m = np.flatnonzero(s["caseid"] == c)
         assert m[0] == pos and m[-1] == pos + len(m) - 1
-        jobs.append((int(c), ends[m], args.vital_dir, keep))
+        jobs.append((int(c), ends[m].reshape(-1), args.vital_dir, keep))
         offsets.append(pos)
         pos += len(m)
     if args.subsets:
@@ -293,13 +320,14 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
         outputs = {f"{part}_{k}": SUBSETS[k] for k in subsets}
     else:
         outputs = {part: keep}
-    writer = TokenWriter(enc, out, outputs, n, args.batch_size)
+    writer = TokenWriter(enc, out, outputs, n, args.batch_size, snap)
     present = np.zeros((n, N_SIG), bool)
     with Pool(args.workers) as pool:
         results = pool.imap(case_windows, jobs, chunksize=2)
         for k, ((_, w, p), off) in enumerate(zip(results, offsets, strict=True), start=1):
-            present[off: off + len(w)] = p
-            writer.add(w, p, np.arange(off, off + len(w)))
+            m = len(w) // snap
+            present[off: off + m] = p.reshape(m, snap, N_SIG).any(1)
+            writer.add(w, p, np.repeat(np.arange(off, off + m), snap))
             if k % 200 == 0:
                 print(f"[{part}] {k}/{len(jobs)} cases ({time.time() - t0:.0f}s)", flush=True)
     writer.close()
@@ -317,6 +345,8 @@ def main() -> None:
     ap.add_argument("--label-data", required=True)
     ap.add_argument("--vital-dir", required=True)
     ap.add_argument("--cases-csv", required=True)
+    ap.add_argument("--labs-csv", default=None, help="lab_data.csv (task aki)")
+    ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
     ap.add_argument("--carmen-src", required=True)
     ap.add_argument("--weights", required=True)
     ap.add_argument("--out", required=True)

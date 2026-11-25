@@ -30,6 +30,7 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import downstream_tasks as T  # noqa: E402
 import probe_ioh as P  # noqa: E402
 import viz_predictions as V  # noqa: E402
 
@@ -120,6 +121,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-cases", type=int, default=None, help="per split (smoke tests)")
     ap.add_argument("--example-cases", type=int, nargs="*", default=[])
+    ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
+    ap.add_argument("--cases-csv", default=None, help="clinical_data.csv (case-level tasks)")
+    ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -133,8 +137,10 @@ def main() -> None:
     split = json.loads((label_data / "split.json").read_text())
     ids = {p: sorted(split[p])[: args.max_cases] for p in P.PARTS}
     t0 = time.time()
-    samples = {p: P.build_samples(load_cases(label_data, ids[p]), lschema, HORIZONS, 5, 15.0)
-               for p in P.PARTS}
+    samples = {p: T.build_task(args.task, load_cases(label_data, ids[p]), lschema,
+                               args.cases_csv, args.labs_csv) for p in P.PARTS}
+    labels = samples["train"]["labels"]
+    simple_name, simple_col, simple_sign = samples["train"]["simple"]
     counts = {p: len(samples[p]["t"]) for p in P.PARTS}
     print(f"samples {counts} ({time.time() - t0:.0f}s)", flush=True)
 
@@ -143,7 +149,7 @@ def main() -> None:
                       encoder.cfg.max_rows, device) for p in P.PARTS}
     y = {p: torch.as_tensor(samples[p]["y"], dtype=torch.float32, device=device)
          for p in P.PARTS}
-    model = IOHModel(encoder, len(HORIZONS)).to(device)
+    model = IOHModel(encoder, len(labels)).to(device)
     opt = torch.optim.AdamW([
         {"params": model.encoder.parameters(), "lr": args.lr_enc},
         {"params": model.head.parameters(), "lr": args.lr_head},
@@ -186,11 +192,12 @@ def main() -> None:
     model.load_state_dict(best_state)
     logit = predict(model, win["test"], counts["test"], device, 512)
 
-    res: dict = {"ckpt": args.ckpt, "scratch": args.scratch, "best_step": best_step,
-                 "best_val_auroc": round(best, 4), "log": log, "counts": counts,
+    res: dict = {"task": args.task, "ckpt": args.ckpt, "scratch": args.scratch,
+                 "best_step": best_step, "best_val_auroc": round(best, 4), "log": log,
+                 "counts": counts,
                  "args": vars(args), "horizons": {}}
     te = samples["test"]
-    for k, h in enumerate(HORIZONS):
+    for k, h in enumerate(labels):
         ok = {p: ~np.isnan(samples[p]["y"][:, k]) for p in P.PARTS}
         yt = te["y"][ok["test"], k]
         g = te["caseid"][ok["test"]]
@@ -199,24 +206,25 @@ def main() -> None:
             "finetuned": 1 / (1 + np.exp(-logit[ok["test"], k])),
             "hand_gbm": P.gbm_probe(hand["train"], samples["train"]["y"][ok["train"], k],
                                     hand["test"]),
-            "map_only": -hand["test"][:, 1],
+            simple_name: simple_sign * hand["test"][:, simple_col],
         }
         res["horizons"][str(h)] = {
             "n": int(len(yt)), "prevalence": round(float(yt.mean()), 4),
             "methods": {m: {**P.bootstrap(yt, s, g), **V.curve_points(yt, s),
-                            "operating": V.operating_points(yt, s, per_hour=12)}
+                            "operating": V.operating_points(yt, s,
+                                                            per_hour=te["per_hour"])}
                         for m, s in scores.items()},
             "calibration": {m: V.calibration(yt, scores[m]) for m in ("finetuned", "hand_gbm")},
         }
         r = res["horizons"][str(h)]["methods"]
-        print(f"--- {h} min: " + "  ".join(
+        print(f"--- {h}: " + "  ".join(
             f"{m} {v['auroc']:.3f} [{v['auroc_ci'][0]:.3f},{v['auroc_ci'][1]:.3f}] "
             f"AUPRC {v['auprc']:.3f}" for m, v in r.items()), flush=True)
 
     # risk over time of a few test cases (every minute with an arterial MAP in the last 5 min)
     examples = []
     mon, col = P.monitor_columns(lschema)
-    for cid in args.example_cases:
+    for cid in args.example_cases if args.task == "ioh" else []:
         c = load_cases(label_data, [cid]).get(cid)
         if c is None:
             continue
@@ -229,7 +237,7 @@ def main() -> None:
         lg = predict(model, w, len(rows), device, 512)
         examples.append({"caseid": cid, "risk_t": V._r(tm[rows], 1),
                          "risk": {str(h): V._r(1 / (1 + np.exp(-lg[:, k])))
-                                  for k, h in enumerate(HORIZONS)}})
+                                  for k, h in enumerate(labels)}})
     res["examples"] = examples
     (out / "result.json").write_text(json.dumps(res))
     torch.save({"model": best_state, "config": encoder.cfg.to_dict(), "step": best_step,

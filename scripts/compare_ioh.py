@@ -24,6 +24,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import downstream_tasks as T  # noqa: E402
 import finetune_ioh as F  # noqa: E402
 import probe_ioh as P  # noqa: E402
 
@@ -77,6 +78,9 @@ def main() -> None:
     ap.add_argument("--reference", default="hand_gbm")
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--max-cases", type=int, default=None)
+    ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
+    ap.add_argument("--cases-csv", default=None, help="clinical_data.csv (case-level tasks)")
+    ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -87,15 +91,17 @@ def main() -> None:
     lschema = TableSchema.load(label_data / "schema.json")
     split = json.loads((label_data / "split.json").read_text())
     ids = {p: sorted(split[p])[: args.max_cases] for p in P.PARTS}
-    samples = {p: P.build_samples(load_cases(label_data, ids[p]), lschema, F.HORIZONS, 5, 15.0)
-               for p in P.PARTS}
+    samples = {p: T.build_task(args.task, load_cases(label_data, ids[p]), lschema,
+                               args.cases_csv, args.labs_csv) for p in P.PARTS}
+    labels = samples["train"]["labels"]
+    simple_name, simple_col, simple_sign = samples["train"]["simple"]
     te = samples["test"]
     n_te = len(te["t"])
 
     logits: dict[str, np.ndarray] = {}  # (n_test, H)
     for name, ckpt in args.finetuned:
         ck = torch.load(ckpt, map_location="cpu", weights_only=False)
-        model = F.IOHModel(UniTTab(UniTTabConfig(**ck["config"])), len(F.HORIZONS))
+        model = F.IOHModel(UniTTab(UniTTabConfig(**ck["config"])), len(labels))
         model.load_state_dict(ck["model"])
         model.to(device)
         win = F.Windows(data, list(te["caseid"]), te["caseid"], te["t"], model.encoder.cfg.max_rows,
@@ -115,12 +121,12 @@ def main() -> None:
                           for p in P.PARTS})
         del enc
 
-    res: dict = {"reference": args.reference, "horizons": {}}
-    for k, h in enumerate(F.HORIZONS):
+    res: dict = {"task": args.task, "reference": args.reference, "horizons": {}}
+    for k, h in enumerate(labels):
         ok = {p: ~np.isnan(samples[p]["y"][:, k]) for p in P.PARTS}
         y = {p: samples[p]["y"][ok[p], k] for p in P.PARTS}
         hand = {p: samples[p]["hand"][ok[p]] for p in P.PARTS}
-        scores = {"map_only": -hand["test"][:, 1],
+        scores = {simple_name: simple_sign * hand["test"][:, simple_col],
                   "hand_gbm": P.gbm_probe(hand["train"], y["train"], hand["test"])}
         if frozen is not None:
             f = frozen[1]
@@ -132,7 +138,7 @@ def main() -> None:
         r = paired(y["test"], te["caseid"][ok["test"]], scores, args.reference, args.n_boot)
         res["horizons"][str(h)] = {"n": int(len(y["test"])),
                                    "prevalence": float(y["test"].mean()), "methods": r}
-        print(f"--- {h} min (n={len(y['test'])}, prevalence {y['test'].mean():.3f}); "
+        print(f"--- {h} (n={len(y['test'])}, prevalence {y['test'].mean():.3f}); "
               f"differences vs {args.reference}", flush=True)
         for m, v in r.items():
             line = f"  {m:<16} AUROC {v['auroc']:.3f}  AUPRC {v['auprc']:.3f}"

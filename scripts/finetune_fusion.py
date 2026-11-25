@@ -43,6 +43,7 @@ from torch import nn
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import downstream_tasks as T  # noqa: E402
 import finetune_ioh as F  # noqa: E402
 import probe_ioh as P  # noqa: E402
 import viz_predictions as V  # noqa: E402
@@ -261,6 +262,9 @@ def main() -> None:
                     help="training: per-sample random signal subsets (instead of --drop-*)")
     ap.add_argument("--select-conds", nargs="+", default=["eap"],
                     help="val conditions whose mean AUROC picks the checkpoint")
+    ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
+    ap.add_argument("--cases-csv", default=None, help="clinical_data.csv (case-level tasks)")
+    ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -274,8 +278,10 @@ def main() -> None:
     split = json.loads((label_data / "split.json").read_text())
     ids = {p: sorted(split[p])[: args.max_cases] for p in P.PARTS}
     t0 = time.time()
-    samples = {p: P.build_samples(load_cases(label_data, ids[p]), lschema, F.HORIZONS, 5, 15.0)
-               for p in P.PARTS}
+    samples = {p: T.build_task(args.task, load_cases(label_data, ids[p]), lschema,
+                               args.cases_csv, args.labs_csv) for p in P.PARTS}
+    labels = samples["train"]["labels"]
+    simple_name, simple_col, simple_sign = samples["train"]["simple"]
     counts = {p: len(samples[p]["t"]) for p in P.PARTS}
     toks = {p: TokenSource(tok_dir, p, samples[p], device, args.token_mode) for p in P.PARTS}
     d_carmen = toks["train"].tok.shape[-1]
@@ -287,7 +293,7 @@ def main() -> None:
     win = {p: F.Windows(data, list(samples[p]["caseid"]), samples[p]["caseid"],
                         samples[p]["t"], encoder.cfg.max_rows, device)
            for p in P.PARTS} if args.mode != "wave" else {p: None for p in P.PARTS}
-    model = FusionModel(args.mode, encoder, d_carmen, m, len(F.HORIZONS)).to(device)
+    model = FusionModel(args.mode, encoder, d_carmen, m, len(labels)).to(device)
     enc_params = list(model.encoder.parameters()) if model.encoder is not None else []
     enc_ids = {id(p) for p in enc_params}
     other = [p for p in model.parameters() if id(p) not in enc_ids]
@@ -356,19 +362,20 @@ def main() -> None:
     np.savez(out / "test_scores.npz", logit=logit, caseid=te["caseid"], t=te["t"],
              has_wave=toks["test"].valid.any(1).cpu().numpy())
 
-    res: dict = {"mode": args.mode, "best_step": best_step, "best_val_auroc": round(best, 4),
-                 "log": log, "counts": counts, "with_waveform": wave_rate, "args": vars(args),
-                 "horizons": {}, "conditions": {}}
+    res: dict = {"task": args.task, "mode": args.mode, "best_step": best_step,
+                 "best_val_auroc": round(best, 4), "log": log, "counts": counts,
+                 "with_waveform": wave_rate, "args": vars(args), "horizons": {},
+                 "conditions": {}}
     for cond, lg in cond_logits.items():
         res["conditions"][cond] = {}
-        for k, h in enumerate(F.HORIZONS):
+        for k, h in enumerate(labels):
             ok = ~np.isnan(te["y"][:, k])
             res["conditions"][cond][str(h)] = P.bootstrap(
                 te["y"][ok, k], lg[ok, k], te["caseid"][ok], n=500)
         print(f"[{cond}] " + "  ".join(
-            f"{h}m AUROC {r['auroc']:.3f} AUPRC {r['auprc']:.3f}"
+            f"{h}: AUROC {r['auroc']:.3f} AUPRC {r['auprc']:.3f}"
             for h, r in res["conditions"][cond].items()), flush=True)
-    for k, h in enumerate(F.HORIZONS):
+    for k, h in enumerate(labels):
         ok = {p: ~np.isnan(samples[p]["y"][:, k]) for p in P.PARTS}
         yt = te["y"][ok["test"], k]
         g = te["caseid"][ok["test"]]
@@ -377,23 +384,24 @@ def main() -> None:
             args.mode: 1 / (1 + np.exp(-logit[ok["test"], k])),
             "hand_gbm": P.gbm_probe(hand["train"], samples["train"]["y"][ok["train"], k],
                                     hand["test"]),
-            "map_only": -hand["test"][:, 1],
+            simple_name: simple_sign * hand["test"][:, simple_col],
         }
         res["horizons"][str(h)] = {
             "n": int(len(yt)), "prevalence": round(float(yt.mean()), 4),
             "methods": {mm: {**P.bootstrap(yt, s, g), **V.curve_points(yt, s),
-                             "operating": V.operating_points(yt, s, per_hour=12)}
+                             "operating": V.operating_points(yt, s,
+                                                             per_hour=te["per_hour"])}
                         for mm, s in scores.items()},
             "calibration": {mm: V.calibration(yt, scores[mm]) for mm in (args.mode, "hand_gbm")},
         }
         r = res["horizons"][str(h)]["methods"]
-        print(f"--- {h} min: " + "  ".join(
+        print(f"--- {h}: " + "  ".join(
             f"{mm} {v['auroc']:.3f} [{v['auroc_ci'][0]:.3f},{v['auroc_ci'][1]:.3f}] "
             f"AUPRC {v['auprc']:.3f}" for mm, v in r.items()), flush=True)
     res["examples"] = [
         {"caseid": int(c), "risk_t": V._r(te["t"][te["caseid"] == c], 1),
          "risk": {str(h): V._r(1 / (1 + np.exp(-logit[te["caseid"] == c, k])))
-                  for k, h in enumerate(F.HORIZONS)}}
+                  for k, h in enumerate(labels)}}
         for c in args.example_cases if (te["caseid"] == c).any()]
     (out / "result.json").write_text(json.dumps(res))
     if not args.eval_only:
