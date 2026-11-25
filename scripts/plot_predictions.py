@@ -360,6 +360,45 @@ def fusion_figs(viz: dict, runs: list[tuple[str, dict, str, str]], out: Path) ->
     plt.close(fig)
 
 
+def robust_fig(cmp: dict, out: Path, models: list[tuple[str, str, str, str]],
+               reference: str = "numeric_ft") -> None:
+    """AUROC / AUPRC under missing-waveform conditions (compare_ioh output).
+
+    ``models``: (prefix in ``compare_ioh --scores NAME``, label, color, linestyle).
+    """
+    conds = [("full", "전체"), ("no_abp", "동맥압 파형 없음\n(ECG+PPG)"),
+             ("abp_only", "동맥압 파형만"), ("no_wave", "파형 없음")]
+    hs = list(cmp["horizons"])
+    fig, axes = plt.subplots(2, len(hs), figsize=(4.6 * len(hs), 7.6), squeeze=False)
+    x = np.arange(len(conds))
+    for col, h in enumerate(hs):
+        ms = cmp["horizons"][h]["methods"]
+        for row, key in enumerate(("auroc", "auprc")):
+            ax = axes[row, col]
+            ref = ms[reference]
+            ax.axhspan(ref[f"{key}_ci"][0], ref[f"{key}_ci"][1], color=MUTED, alpha=0.15, lw=0)
+            ax.axhline(ref[key], color=MUTED, lw=1.5, ls="--", label="수치만 (미세조정)")
+            for i, (prefix, label, color, ls) in enumerate(models):
+                xs = x + (i - (len(models) - 1) / 2) * 0.07  # dodge
+                ys = [ms[f"{prefix}:{c}"][key] for c, _ in conds]
+                lo = [ms[f"{prefix}:{c}"][f"{key}_ci"][0] for c, _ in conds]
+                hi = [ms[f"{prefix}:{c}"][f"{key}_ci"][1] for c, _ in conds]
+                ax.errorbar(xs, ys, yerr=[np.subtract(ys, lo), np.subtract(hi, ys)], color=color,
+                            ls=ls, marker="o", ms=6, lw=2, capsize=0, elinewidth=1.2,
+                            label=label)
+            ax.set_xticks(x, [c[1] for c in conds], fontsize=8.5)
+            ax.set_title(f"{h}분 내 저혈압 · {key.upper()}")
+            if col == 0:
+                ax.set_ylabel(key.upper())
+    h, lab = axes[0, 0].get_legend_handles_labels()
+    fig.legend(h, lab, loc="lower center", ncol=5, fontsize=9, bbox_to_anchor=(0.5, -0.03))
+    fig.suptitle("파형이 빠졌을 때 — 같은 test 환자 (회색 띠 = 수치만 모델의 95% CI)", color=INK,
+                 fontsize=13, y=1.01)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.savefig(out / "robust.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("json")
@@ -371,6 +410,7 @@ def main() -> None:
                     metavar=("LABEL", "RESULT_JSON", "KEY"),
                     help="result.json files to overlay (finetune_ioh / finetune_fusion)")
     ap.add_argument("--paired-out", default="ft_paired.png")
+    ap.add_argument("--robust", help="compare_ioh output with <model>:<condition> scores")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -378,6 +418,15 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     setup()
+    if args.robust:
+        robust_fig(json.loads(Path(args.robust).read_text()), out, [
+            ("fu_fusion_md", "cross-attention + modality dropout", BLUE, "-"),
+            ("fu_late_md", "단순 결합 + modality dropout", ORANGE, "-"),
+            ("fu_fusion_eval", "cross-attention (dropout 없음)", BLUE, ":"),
+            ("fu_late_eval", "단순 결합 (dropout 없음)", ORANGE, ":"),
+        ])
+        print(f"figures in {out}")
+        return
     if args.fusion:
         colors = [BLUE, "#6250d6", ORANGE, MUTED, "#e87ba4"]
         runs = [(lab, json.loads(Path(pth).read_text()), key, colors[i % len(colors)])
