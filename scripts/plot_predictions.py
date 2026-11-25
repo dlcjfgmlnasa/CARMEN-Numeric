@@ -399,6 +399,41 @@ def robust_fig(cmp: dict, out: Path, models: list[tuple[str, str, str, str]],
     plt.close(fig)
 
 
+TASK_NAME = {"aki": "수술 후 AKI", "mortality": "원내 사망", "icu": "ICU 입실"}
+
+
+def case_fig(cmps: dict[str, dict], out: Path, methods: list[tuple[str, str, str]]) -> None:
+    """AUROC / AUPRC with 95 % CI per case-level task (one compare_ioh output per task)."""
+    tasks = list(cmps)
+    fig, axes = plt.subplots(2, len(tasks), figsize=(4.4 * len(tasks), 7.2), squeeze=False)
+    for col, task in enumerate(tasks):
+        r = next(iter(cmps[task]["horizons"].values()))
+        ms = r["methods"]
+        for row, key in enumerate(("auroc", "auprc")):
+            ax = axes[row, col]
+            present = [(m, lab, c) for m, lab, c in methods if m in ms]
+            y = np.arange(len(present))
+            for i, (m, _, color) in enumerate(present):
+                v = ms[m]
+                ax.plot(v[f"{key}_ci"], [i, i], color=color, lw=2, solid_capstyle="round")
+                ax.plot([v[key]], [i], "o", color=color, ms=7, mec=SURFACE, mew=1.5)
+                ax.text(v[f"{key}_ci"][1], i, f"  {v[key]:.3f}", va="center", fontsize=8,
+                        color=INK2)
+            if key == "auprc":
+                ax.axvline(r["prevalence"], color=MUTED, lw=1, ls=":")
+            ax.set_yticks(y, [lab for _, lab, _ in present] if col == 0 else [""] * len(y))
+            ax.invert_yaxis()
+            ax.grid(axis="y", visible=False)
+            name = TASK_NAME.get(task, task)
+            ax.set_title(f"{name} · {key.upper()}  (n={r['n']}, "
+                         f"발생률 {r['prevalence'] * 100:.1f}%)", fontsize=10)
+    fig.suptitle("케이스 단위 결과 예측 — test 환자 (선 = 95% CI, 점선 = 발생률)", color=INK,
+                 fontsize=13, y=1.01)
+    fig.tight_layout()
+    fig.savefig(out / "case_tasks.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("json")
@@ -412,6 +447,11 @@ def main() -> None:
     ap.add_argument("--paired-out", default="ft_paired.png")
     ap.add_argument("--robust", help="compare_ioh output with <model>:<condition> scores")
     ap.add_argument("--robust-extra", help="second compare_ioh output merged into --robust")
+    ap.add_argument("--robust-models", nargs="+", default=None,
+                    help="PREFIX=LABEL entries for --robust (default: the dropout comparison)")
+    ap.add_argument("--robust-conds", nargs="+", default=None, help="COND=LABEL entries")
+    ap.add_argument("--case", nargs=2, action="append", default=[], metavar=("TASK", "JSON"),
+                    help="compare_ioh output of a case-level task (repeatable)")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -419,6 +459,27 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     setup()
+    if args.case:
+        case_fig({t: json.loads(Path(pth).read_text()) for t, pth in args.case}, out, [
+            ("hypo_minutes", "저혈압 누적 시간 (단일 지표)", AQUA),
+            ("hand_gbm", "수작업 특징 + GBM", MUTED),
+            ("numeric_ft", "수치만 (미세조정)", ORANGE),
+            ("fusion:eap", "수치 + 파형 (ABP+ECG+PPG)", BLUE),
+            ("fusion:ep", "수치 + 파형 (동맥관 없음)", "#6250d6"),
+            ("fusion:a", "수치 + 파형 (ABP만)", "#e87ba4"),
+            ("fusion:none", "수치 + 파형 모델, 파형 없음", INK2),
+        ])
+        print(f"figures in {out}")
+        return
+    if args.robust and args.robust_models:
+        cols = [BLUE, "#6250d6", ORANGE, MUTED]
+        models = [(kv.split("=", 1)[0], kv.split("=", 1)[1], cols[i % len(cols)], "-")
+                  for i, kv in enumerate(args.robust_models)]
+        conds = [tuple(kv.split("=", 1)) for kv in args.robust_conds] if args.robust_conds \
+            else None
+        robust_fig(json.loads(Path(args.robust).read_text()), out, models, conds=conds)
+        print(f"figures in {out}")
+        return
     if args.robust:
         cmp = json.loads(Path(args.robust).read_text())
         conds = None
