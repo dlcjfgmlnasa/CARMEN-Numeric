@@ -262,12 +262,45 @@ def finetune_figs(viz: dict, ft: dict, scratch: dict | None, out: Path) -> None:
     plt.close(fig)
 
 
+def paired_fig(cmp: dict, out: Path, methods: list[tuple[str, str, str]]) -> None:
+    """Paired AUROC / AUPRC differences vs. the reference, with patient-bootstrap 95 % CI."""
+    hs = list(cmp["horizons"])
+    fig, axes = plt.subplots(1, 2, figsize=(12, 0.6 + 0.42 * len(methods) * len(hs)),
+                             sharey=True)
+    for ax, key, title in ((axes[0], "auroc", "AUROC 차이"), (axes[1], "auprc", "AUPRC 차이")):
+        y = 0
+        ticks, labels = [], []
+        for m, label, color in methods:
+            for h in hs:
+                r = cmp["horizons"][h]["methods"][m]
+                d, ci = r[f"d_{key}"], r[f"d_{key}_ci"]
+                ax.plot(ci, [y, y], color=color, lw=2, solid_capstyle="round")
+                ax.plot([d], [y], marker="o", ms=7, color=color, mec=SURFACE, mew=1.5)
+                ticks.append(y)
+                labels.append(f"{label} · {h}분")
+                y += 1
+            y += 0.6
+        ax.axvline(0, color=INK2, lw=1)
+        ax.set_title(f"{title} (기준: 수작업 추세 특징 + GBM)")
+        ax.set_xlabel("차이 (0보다 크면 기준보다 좋음) · 선 = 95% 신뢰구간")
+        ax.grid(axis="y", visible=False)
+    axes[0].set_yticks(ticks, labels)
+    axes[0].invert_yaxis()
+    fig.suptitle("같은 test 환자에서 짝지은 비교", color=INK, fontsize=13, y=1.01)
+    fig.tight_layout()
+    fig.savefig(out / "ft_paired.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("json")
     ap.add_argument("--out", required=True)
     ap.add_argument("--finetune", help="finetune_ioh.py result.json (pre-trained encoder)")
     ap.add_argument("--scratch", help="finetune_ioh.py result.json (--scratch)")
+    ap.add_argument("--compare", help="compare_ioh.py output (paired differences)")
+    ap.add_argument("--compare-methods", nargs="+", default=[],
+                    help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
     d = json.loads(Path(args.json).read_text())
     out = Path(args.out)
@@ -277,6 +310,11 @@ def main() -> None:
         ft = json.loads(Path(args.finetune).read_text())
         sc = json.loads(Path(args.scratch).read_text()) if args.scratch else None
         finetune_figs(d, ft, sc, out)
+        if args.compare:
+            colors = [BLUE, "#6250d6", MUTED, AQUA]
+            ms = [(kv.split("=", 1)[0], kv.split("=", 1)[1], colors[i % len(colors)])
+                  for i, kv in enumerate(args.compare_methods)]
+            paired_fig(json.loads(Path(args.compare).read_text()), out, ms)
         print(f"figures in {out}")
         return
     forecast_examples(d, out)
