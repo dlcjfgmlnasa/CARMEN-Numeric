@@ -262,7 +262,8 @@ def finetune_figs(viz: dict, ft: dict, scratch: dict | None, out: Path) -> None:
     plt.close(fig)
 
 
-def paired_fig(cmp: dict, out: Path, methods: list[tuple[str, str, str]]) -> None:
+def paired_fig(cmp: dict, out: Path, methods: list[tuple[str, str, str]],
+               name: str = "ft_paired.png") -> None:
     """Paired AUROC / AUPRC differences vs. the reference, with patient-bootstrap 95 % CI."""
     hs = list(cmp["horizons"])
     fig, axes = plt.subplots(1, 2, figsize=(12, 0.6 + 0.42 * len(methods) * len(hs)),
@@ -288,7 +289,72 @@ def paired_fig(cmp: dict, out: Path, methods: list[tuple[str, str, str]]) -> Non
     axes[0].invert_yaxis()
     fig.suptitle("같은 test 환자에서 짝지은 비교", color=INK, fontsize=13, y=1.01)
     fig.tight_layout()
-    fig.savefig(out / "ft_paired.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out / name, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fusion_figs(viz: dict, runs: list[tuple[str, dict, str, str]], out: Path) -> None:
+    """ROC per horizon and risk over time for several result.json files.
+
+    ``runs``: (label, result.json dict, method key inside it, color).
+    """
+    ref = runs[0][1]
+    hs = list(ref["horizons"])
+    fig, axes = plt.subplots(1, len(hs), figsize=(4.4 * len(hs), 4.5))
+    for ax, h in zip(axes, hs, strict=True):
+        ax.plot([0, 1], [0, 1], color=AXIS, lw=1)
+        for label, res, key, color in runs:
+            m = res["horizons"][h]["methods"][key]
+            ax.plot(arr(m["fpr"]), arr(m["tpr"]), color=color, lw=2 if key != "hand_gbm" else 1.5,
+                    label=f"{label}  {m['auroc']:.3f}")
+        mo = ref["horizons"][h]["methods"]["map_only"]
+        ax.plot(arr(mo["fpr"]), arr(mo["tpr"]), color=AQUA, ls="--", lw=1.5,
+                label=f"현재 MAP만  {mo['auroc']:.3f}")
+        ax.set_title(f"{h}분 내 저혈압 (발생률 {ref['horizons'][h]['prevalence'] * 100:.1f}%)")
+        ax.set_xlabel("위양성률 (1 - 특이도)")
+        ax.set_aspect("equal")
+        ax.legend(loc="lower right", fontsize=7.5, title="AUROC", title_fontsize=8)
+    axes[0].set_ylabel("민감도")
+    fig.suptitle("저혈압 예측 — 수치 + CARMEN 파형 (test 환자)", color=INK, fontsize=13, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out / "fusion_roc.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    ex = {e["caseid"]: e for e in viz["examples"]}
+    cases = [e["caseid"] for e in runs[0][1].get("examples", []) if e["caseid"] in ex]
+    if not cases:
+        return
+    fig, axes = plt.subplots(2 * len(cases), 1, figsize=(13, 3.3 * len(cases)), squeeze=False,
+                             gridspec_kw={"height_ratios": [2, 1] * len(cases)})
+    for i, cid in enumerate(cases):
+        v = ex[cid]
+        ax, ar = axes[2 * i, 0], axes[2 * i + 1, 0]
+        t = arr(v["series"]["t"])
+        mp = arr(v["series"]["art_mbp"])
+        ax.plot(t, mp, color=INK2, lw=1.4)
+        low = mp < 65
+        ax.scatter(t[low], mp[low], color=CRITICAL, s=10, zorder=3, label="65 미만")
+        ax.axhline(65, color=CRITICAL, lw=1, ls="--")
+        for o in v["onsets_t"]:
+            for a in (ax, ar):
+                a.axvline(o, color=CRITICAL, lw=0.8, alpha=0.6)
+        ax.set_ylabel("동맥압 MAP\n(mmHg)")
+        tag = "저혈압 있음" if v["has_onset"] else "저혈압 없음"
+        ax.set_title(f"케이스 {cid} ({tag}) — 세로선 = 저혈압 시작, 점 = 5분마다 예측", loc="left")
+        for label, res, _, color in runs:
+            e = next((x for x in res.get("examples", []) if x["caseid"] == cid), None)
+            if e is not None:
+                ar.plot(arr(e["risk_t"]), arr(e["risk"]["5"]), color=color, lw=1.6, marker="o",
+                        ms=3, label=label)
+        ar.set_ylim(0, 1)
+        ar.set_ylabel("5분 내\n저혈압 위험")
+        ar.set_xlim(ax.get_xlim())
+        if i == 0:
+            ar.legend(loc="upper right", ncol=3, fontsize=9)
+            ax.legend(loc="upper right", fontsize=9)
+    axes[-1, 0].set_xlabel("마취 시작 후 시간 (분)")
+    fig.tight_layout()
+    fig.savefig(out / "fusion_risk_timelines.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -299,6 +365,10 @@ def main() -> None:
     ap.add_argument("--finetune", help="finetune_ioh.py result.json (pre-trained encoder)")
     ap.add_argument("--scratch", help="finetune_ioh.py result.json (--scratch)")
     ap.add_argument("--compare", help="compare_ioh.py output (paired differences)")
+    ap.add_argument("--fusion", nargs=3, action="append", default=[],
+                    metavar=("LABEL", "RESULT_JSON", "KEY"),
+                    help="result.json files to overlay (finetune_ioh / finetune_fusion)")
+    ap.add_argument("--paired-out", default="ft_paired.png")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -306,6 +376,18 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     setup()
+    if args.fusion:
+        colors = [BLUE, "#6250d6", ORANGE, MUTED, "#e87ba4"]
+        runs = [(lab, json.loads(Path(pth).read_text()), key, colors[i % len(colors)])
+                for i, (lab, pth, key) in enumerate(args.fusion)]
+        fusion_figs(d, runs, out)
+        if args.compare:
+            cols = [BLUE, "#6250d6", ORANGE, MUTED, AQUA]
+            ms = [(kv.split("=", 1)[0], kv.split("=", 1)[1], cols[i % len(cols)])
+                  for i, kv in enumerate(args.compare_methods)]
+            paired_fig(json.loads(Path(args.compare).read_text()), out, ms, args.paired_out)
+        print(f"figures in {out}")
+        return
     if args.finetune:
         ft = json.loads(Path(args.finetune).read_text())
         sc = json.loads(Path(args.scratch).read_text()) if args.scratch else None
