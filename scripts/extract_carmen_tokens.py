@@ -12,6 +12,9 @@ holds nothing after ``t``. Arterial pressure, ECG lead II and PPG (``SNUADC/ART`
 (range check, median filter for ABP/PPG, 60 Hz notch for ECG/PPG, Butterworth band/low-pass,
 ``resample_poly`` to 100 Hz) on the window plus 2 s of past padding. A signal is absent for
 a sample when > 30 % of its window is missing or flat; small gaps are interpolated.
+``--signals`` restricts what CARMEN sees: since the signals of a sample are encoded jointly,
+masking one signal's tokens afterwards still leaves its information in the others' tokens —
+to emulate a missing arterial line, re-encode with ``--signals ecg ppg``.
 
 CARMEN (frozen, ``task="masked"``, any-variate packing: the three signals of a sample attend
 to each other) encodes 240 patches (0.25 s) per signal; patches are mean-pooled into 5 s
@@ -92,8 +95,8 @@ def preprocess(x: np.ndarray, rng: tuple, median_k: int, notch: float | None,
 
 
 def case_windows(args: tuple) -> tuple[int, np.ndarray, np.ndarray]:
-    """(caseid, window ends in s) -> (caseid, (n, 3, N_WIN) waveforms, (n, 3) presence)."""
-    caseid, ends, vital_dir = args
+    """(caseid, window ends in s, vital dir, kept slots) -> (caseid, (n, 3, N_WIN), (n, 3))."""
+    caseid, ends, vital_dir, keep = args
     import vitaldb
 
     n = len(ends)
@@ -108,7 +111,7 @@ def case_windows(args: tuple) -> tuple[int, np.ndarray, np.ndarray]:
         return caseid, wave, present
     names = set(vf.get_track_names())
     for slot, track, rng, mk, notch, filt in SIGNALS:
-        if track not in names:
+        if track not in names or slot not in keep:
             continue
         x = vf.to_numpy([track], 1 / NATIVE_SR)
         if x is None or x.size == 0:
@@ -244,6 +247,8 @@ class TokenWriter:
 
 def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0: float) -> None:
     label_data = Path(args.label_data)
+    names = {"ecg": 0, "abp": 1, "ppg": 2}
+    keep = tuple(names[k] for k in args.signals)
     s = P.build_samples(load_cases(label_data, ids), schema, [5, 10, 15], 5, 15.0)
     n = len(s["t"])
     start = {}
@@ -255,7 +260,7 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
     for c in np.unique(s["caseid"]):  # build_samples orders samples by caseid
         m = np.flatnonzero(s["caseid"] == c)
         assert m[0] == pos and m[-1] == pos + len(m) - 1
-        jobs.append((int(c), ends[m], args.vital_dir))
+        jobs.append((int(c), ends[m], args.vital_dir, keep))
         offsets.append(pos)
         pos += len(m)
     writer = TokenWriter(enc, out / f"{part}_tokens.npy", n, args.batch_size)
@@ -295,6 +300,10 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--max-cases", type=int, default=None)
     ap.add_argument("--splits", nargs="+", default=list(P.PARTS))
+    ap.add_argument("--signals", nargs="+", default=["ecg", "abp", "ppg"],
+                    choices=["ecg", "abp", "ppg"],
+                    help="signals given to CARMEN (others are treated as absent), e.g. "
+                         "'ecg ppg' to encode as if there were no arterial line")
     args = ap.parse_args()
 
     torch.set_num_threads(4)
