@@ -341,7 +341,9 @@ def fusion_figs(viz: dict, runs: list[tuple[str, dict, str, str]], out: Path) ->
         ax.set_ylabel("동맥압 MAP\n(mmHg)")
         tag = "저혈압 있음" if v["has_onset"] else "저혈압 없음"
         ax.set_title(f"케이스 {cid} ({tag}) — 세로선 = 저혈압 시작, 점 = 5분마다 예측", loc="left")
-        for label, res, _, color in runs:
+        for label, res, key, color in runs:
+            if key in ("hand_gbm", "map_only"):
+                continue
             e = next((x for x in res.get("examples", []) if x["caseid"] == cid), None)
             if e is not None:
                 ar.plot(arr(e["risk_t"]), arr(e["risk"]["5"]), color=color, lw=1.6, marker="o",
