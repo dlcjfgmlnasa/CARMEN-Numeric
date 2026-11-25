@@ -413,13 +413,28 @@ TASK_NAME = {"aki": "수술 후 AKI", "mortality": "원내 사망", "icu": "ICU 
 def case_fig(cmps: dict[str, dict], out: Path, methods: list[tuple[str, str, str]]) -> None:
     """AUROC / AUPRC with 95 % CI per case-level task (one compare_ioh output per task)."""
     tasks = list(cmps)
+    firsts = [next(iter(cmps[t]["horizons"].values()))["methods"] for t in tasks]
+    # a "<model>:<condition>" group that scores identically in every task gets one row
+    groups: dict[str, list[str]] = {}
+    for m, _, _ in methods:
+        if ":" in m and any(m in ms for ms in firsts):
+            groups.setdefault(m.split(":")[0], []).append(m)
+    rows = []
+    for m, lab, c in methods:
+        g = groups.get(m.split(":")[0], []) if ":" in m else []
+        if len(g) > 1 and all(len({(ms[x]["auroc"], ms[x]["auprc"]) for x in g if x in ms}) <= 1
+                              for ms in firsts):
+            if m != g[0]:
+                continue
+            lab = lab.split(" (")[0] + " — 파형 조건과 무관하게 동일"
+        rows.append((m, lab, c))
     fig, axes = plt.subplots(2, len(tasks), figsize=(4.4 * len(tasks), 7.2), squeeze=False)
     for col, task in enumerate(tasks):
         r = next(iter(cmps[task]["horizons"].values()))
         ms = r["methods"]
         for row, key in enumerate(("auroc", "auprc")):
             ax = axes[row, col]
-            present = [(m, lab, c) for m, lab, c in methods if m in ms]
+            present = [(m, lab, c) for m, lab, c in rows if m in ms]
             y = np.arange(len(present))
             for i, (m, _, color) in enumerate(present):
                 v = ms[m]
@@ -439,6 +454,44 @@ def case_fig(cmps: dict[str, dict], out: Path, methods: list[tuple[str, str, str
                  fontsize=13, y=1.01)
     fig.tight_layout()
     fig.savefig(out / "case_tasks.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def task_delta_fig(specs: list[tuple[str, dict, str, str, str]], out: Path,
+                   conds: list[tuple[str, str]], reference: str = "numeric_ft") -> None:
+    """Paired difference to ``reference`` per task, waveform condition and fusion design.
+
+    ``specs``: (task label, compare_ioh output, horizon key, cross-attn prefix, residual prefix).
+    """
+    fig, axes = plt.subplots(2, len(specs), figsize=(3.9 * len(specs), 7.0), squeeze=False)
+    x = np.arange(len(conds))
+    designs = [("cross-attention 융합", BLUE, -0.13), ("잔차 융합 (수치 고정)", ORANGE, 0.13)]
+    for col, (label, cmp, h, cross, res) in enumerate(specs):
+        r = cmp["horizons"][h]
+        ms = r["methods"]
+        n_pos = round(r["n"] * r["prevalence"])
+        for row, key in enumerate(("auroc", "auprc")):
+            ax = axes[row, col]
+            ax.axhline(0, color=MUTED, lw=1.5, ls="--")
+            for (name, color, dx), prefix in zip(designs, (cross, res), strict=True):
+                v = [ms[f"{prefix}:{c}"] for c, _ in conds]
+                ys = np.array([m[f"d_{key}"] for m in v])
+                lo = ys - np.array([m[f"d_{key}_ci"][0] for m in v])
+                hi = np.array([m[f"d_{key}_ci"][1] for m in v]) - ys
+                ax.errorbar(x + dx, ys, yerr=[lo, hi], fmt="o", color=color, ms=6, capsize=3,
+                            lw=1.6, mec=SURFACE, mew=1.2, label=name if col == 0 else None)
+            ax.set_xticks(x, [lab for _, lab in conds], fontsize=8)
+            ax.grid(axis="x", visible=False)
+            ax.set_title(f"{label} · Δ{key.upper()}\n(test n={r['n']}, 양성 {n_pos})",
+                         fontsize=10)
+            if col == 0:
+                ax.set_ylabel(f"{key.upper()} 차이 (vs 수치만)")
+    fig.legend(*axes[0, 0].get_legend_handles_labels(), loc="lower center", ncol=2,
+               frameon=False, bbox_to_anchor=(0.5, -0.03))
+    fig.suptitle("과제별 — 파형을 더했을 때 수치만 모델 대비 차이 "
+                 "(같은 test 환자, paired bootstrap 95% CI)", color=INK, fontsize=13, y=1.01)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.savefig(out / "task_delta.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -463,6 +516,9 @@ def main() -> None:
                     help="also draw robust_delta.png (paired difference to numeric_ft)")
     ap.add_argument("--case", nargs=2, action="append", default=[], metavar=("TASK", "JSON"),
                     help="compare_ioh output of a case-level task (repeatable)")
+    ap.add_argument("--task-delta", nargs=5, action="append", default=[],
+                    metavar=("LABEL", "JSON", "HORIZON", "CROSS", "RESIDUAL"),
+                    help="compare_ioh output per task for task_delta.png (repeatable)")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -470,6 +526,11 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     setup()
+    if args.task_delta:
+        task_delta_fig([(lab.replace("\\n", "\n"), json.loads(Path(pth).read_text()), h, c, r)
+                        for lab, pth, h, c, r in args.task_delta], out,
+                       [("eap", "ABP\nECG\nPPG"), ("a", "ABP"), ("ep", "ECG\nPPG"),
+                        ("none", "파형\n없음")])
     if args.case:
         case_fig({t: json.loads(Path(pth).read_text()) for t, pth in args.case}, out, [
             ("hypo_minutes", "저혈압 누적 시간 (단일 지표)", AQUA),
@@ -482,6 +543,7 @@ def main() -> None:
             ("gatef:ep", "잔차 융합 (동맥관 없음)", "#9b8ce8"),
             ("gatef:none", "잔차 융합, 파형 없음", "#5c5b57"),
         ])
+    if args.case or args.task_delta:
         print(f"figures in {out}")
         return
     if args.robust and args.robust_models:
