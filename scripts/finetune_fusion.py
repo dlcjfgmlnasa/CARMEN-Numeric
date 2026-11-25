@@ -14,8 +14,12 @@ Samples, labels and splits are those of ``probe_ioh.py``; waveform tokens come f
 queries, then attention to the projected waveform tokens + a learned "no waveform" token)
 update them, and an MLP gives one logit per horizon. ``wave``: the same blocks with learned
 queries and no numeric encoder. ``late``: the numeric features concatenated with mean-pooled
-waveform tokens. CARMEN stays frozen. The step with the best mean val AUROC is kept; test
-metrics, curves and logits (``test_scores.npz``) are written.
+waveform tokens. ``gated``: the numeric MLP head of ``finetune_ioh.py`` plus a residual waveform
+branch (cross-attention blocks + MLP whose last layer starts at zero), so the model starts as the
+numeric-only model; with ``--init-from`` (a ``finetune_ioh.py`` ``best.pt``) it starts from
+that model's weights and the step-0 state competes in checkpoint selection. CARMEN stays
+frozen. The step with the best mean val AUROC is kept; test metrics, curves and logits
+(``test_scores.npz``) are written.
 
 Missing modalities: ``--drop-wave`` / ``--drop-signal`` hide all waveform tokens of a sample
 / the tokens of one signal at random during training (modality dropout); ``--subset-train``
@@ -197,14 +201,22 @@ class FusionModel(nn.Module):
         self.mode = mode
         self.encoder = encoder if mode != "wave" else None
         self.wave = WaveTokens(d_carmen, m)
-        if mode in ("fusion", "wave"):
+        if mode in ("fusion", "wave", "gated"):
             self.cross = CrossBlocks(m, dropout=dropout)
         if mode == "wave":
             self.queries = nn.Parameter(torch.randn(1, 3, m) * 0.02)
-        width = {"fusion": 3 * m, "wave": 3 * m, "late": 4 * m}[mode]
-        self.head = nn.Sequential(nn.LayerNorm(width), nn.Dropout(dropout),
-                                  nn.Linear(width, 256), nn.GELU(), nn.Dropout(dropout),
-                                  nn.Linear(256, n_out))
+        width = {"fusion": 3 * m, "wave": 3 * m, "late": 4 * m, "gated": 3 * m}[mode]
+        self.head = self._mlp(width, n_out, dropout)
+        if mode == "gated":  # residual waveform branch, zero at init
+            self.wave_head = self._mlp(3 * m, n_out, dropout)
+            nn.init.zeros_(self.wave_head[-1].weight)
+            nn.init.zeros_(self.wave_head[-1].bias)
+
+    @staticmethod
+    def _mlp(width: int, n_out: int, dropout: float) -> nn.Sequential:  # = IOHModel.head
+        return nn.Sequential(nn.LayerNorm(width), nn.Dropout(dropout),
+                             nn.Linear(width, 256), nn.GELU(), nn.Dropout(dropout),
+                             nn.Linear(256, n_out))
 
     def numeric_queries(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:  # (B, 3, m)
         z = self.encoder.encode(batch)
@@ -221,6 +233,9 @@ class FusionModel(nn.Module):
             keep = (~pad).float()[..., None]
             w = (mem * keep).sum(1) / keep.sum(1)  # null token is always kept
             return self.head(torch.cat([q.flatten(1), w], 1))
+        if self.mode == "gated":
+            q = self.numeric_queries(batch)
+            return self.head(q.flatten(1)) + self.wave_head(self.cross(q, mem, pad).flatten(1))
         q = self.numeric_queries(batch) if self.mode == "fusion" \
             else self.queries.expand(tok.shape[0], -1, -1)
         return self.head(self.cross(q, mem, pad).flatten(1))
@@ -246,7 +261,7 @@ def predict_cond(model, win, src: TokenSource, cond: str, n: int, device,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--mode", required=True, choices=["fusion", "wave", "late"])
+    ap.add_argument("--mode", required=True, choices=["fusion", "wave", "late", "gated"])
     ap.add_argument("--data", required=True)
     ap.add_argument("--label-data", required=True)
     ap.add_argument("--ckpt", required=True, help="pre-trained UniTTab (also sets d_model)")
@@ -277,8 +292,12 @@ def main() -> None:
     ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
     ap.add_argument("--cases-csv", default=None, help="clinical_data.csv (case-level tasks)")
     ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
+    ap.add_argument("--init-from", default=None,
+                    help="--mode gated: finetune_ioh.py best.pt for the encoder + numeric head")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.init_from and args.mode != "gated":
+        ap.error("--init-from needs --mode gated")
 
     torch.set_num_threads(4)
     torch.manual_seed(args.seed)
@@ -306,6 +325,12 @@ def main() -> None:
                         samples[p]["t"], encoder.cfg.max_rows, device)
            for p in P.PARTS} if args.mode != "wave" else {p: None for p in P.PARTS}
     model = FusionModel(args.mode, encoder, d_carmen, m, len(labels)).to(device)
+    if args.init_from:
+        ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        missing, unexpected = model.load_state_dict(ck["model"], strict=False)
+        if unexpected or any(k.startswith(("encoder.", "head.")) for k in missing):
+            raise ValueError(f"{args.init_from}: not a finetune_ioh.py model of this size")
+        model.to(device)
     enc_params = list(model.encoder.parameters()) if model.encoder is not None else []
     enc_ids = {id(p) for p in enc_params}
     other = [p for p in model.parameters() if id(p) not in enc_ids]
@@ -319,6 +344,26 @@ def main() -> None:
     gen = torch.Generator(device=device).manual_seed(args.seed)
     best, best_state, best_step, bad, log = -1.0, None, 0, 0, []
     model.train()
+
+    def validate(step: int, loss: float) -> bool:
+        """Log val AUROC, keep the best state; True when patience is used up."""
+        nonlocal best, best_state, best_step, bad
+        va = float(np.mean([
+            F.mean_auroc(samples["val"]["y"], predict_cond(model, win["val"], toks["val"],
+                                                           c, counts["val"], device))
+            for c in args.select_conds]))
+        log.append({"step": step, "loss": round(loss, 4), "val_auroc": round(va, 4)})
+        print(json.dumps(log[-1]) + f" ({time.time() - t0:.0f}s)", flush=True)
+        if va > best:
+            best, best_step, bad = va, step, 0
+            best_state = copy.deepcopy({k: v.detach().cpu()
+                                        for k, v in model.state_dict().items()})
+            return False
+        bad += 1
+        return bad >= args.patience
+
+    if args.init_from and not args.eval_only:
+        validate(0, float("nan"))  # the numeric-only starting point competes
     if args.eval_only:
         ck = torch.load(args.eval_only, map_location="cpu", weights_only=False)
         if ck["mode"] != args.mode:
@@ -346,22 +391,9 @@ def main() -> None:
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
-        if step % args.eval_every == 0 or step == args.steps:
-            va = float(np.mean([
-                F.mean_auroc(samples["val"]["y"], predict_cond(model, win["val"], toks["val"],
-                                                               c, counts["val"], device))
-                for c in args.select_conds]))
-            log.append({"step": step, "loss": round(loss.item(), 4), "val_auroc": round(va, 4)})
-            print(json.dumps(log[-1]) + f" ({time.time() - t0:.0f}s)", flush=True)
-            if va > best:
-                best, best_step, bad = va, step, 0
-                best_state = copy.deepcopy({k: v.detach().cpu()
-                                            for k, v in model.state_dict().items()})
-            else:
-                bad += 1
-                if bad >= args.patience:
-                    print(f"early stop at {step}", flush=True)
-                    break
+        if (step % args.eval_every == 0 or step == args.steps) and validate(step, loss.item()):
+            print(f"early stop at {step}", flush=True)
+            break
     model.load_state_dict(best_state)
     te = samples["test"]
     cond_logits = {}
