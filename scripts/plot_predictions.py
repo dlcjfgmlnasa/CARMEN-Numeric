@@ -361,13 +361,13 @@ def fusion_figs(viz: dict, runs: list[tuple[str, dict, str, str]], out: Path) ->
 
 
 def robust_fig(cmp: dict, out: Path, models: list[tuple[str, str, str, str]],
-               reference: str = "numeric_ft") -> None:
+               reference: str = "numeric_ft", conds: list[tuple[str, str]] | None = None) -> None:
     """AUROC / AUPRC under missing-waveform conditions (compare_ioh output).
 
     ``models``: (prefix in ``compare_ioh --scores NAME``, label, color, linestyle).
     """
-    conds = [("full", "전체"), ("no_abp", "동맥압 파형 없음\n(ECG+PPG)"),
-             ("abp_only", "동맥압 파형만"), ("no_wave", "파형 없음")]
+    conds = conds or [("full", "전체"), ("no_abp", "동맥압 파형 없음\n(ECG+PPG)"),
+                      ("abp_only", "동맥압 파형만"), ("no_wave", "파형 없음")]
     hs = list(cmp["horizons"])
     fig, axes = plt.subplots(2, len(hs), figsize=(4.6 * len(hs), 7.6), squeeze=False)
     x = np.arange(len(conds))
@@ -411,6 +411,7 @@ def main() -> None:
                     help="result.json files to overlay (finetune_ioh / finetune_fusion)")
     ap.add_argument("--paired-out", default="ft_paired.png")
     ap.add_argument("--robust", help="compare_ioh output with <model>:<condition> scores")
+    ap.add_argument("--robust-extra", help="second compare_ioh output merged into --robust")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -419,12 +420,24 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     setup()
     if args.robust:
-        robust_fig(json.loads(Path(args.robust).read_text()), out, [
+        cmp = json.loads(Path(args.robust).read_text())
+        conds = None
+        if args.robust_extra:  # e.g. re-encoded no-arterial-line scores: "<run>:noabp_true"
+            extra = json.loads(Path(args.robust_extra).read_text())
+            rename = {"fu_fusion": "fu_fusion_eval", "fu_late": "fu_late_eval"}
+            for h, r in extra["horizons"].items():
+                for k, v in r["methods"].items():
+                    if ":" in k:
+                        run, c = k.split(":", 1)
+                        cmp["horizons"][h]["methods"][f"{rename.get(run, run)}:{c}"] = v
+            conds = [("full", "전체 (ABP+ECG+PPG)"),
+                     ("noabp_true", "동맥관 없음\n(ECG+PPG 재인코딩)"), ("no_wave", "파형 없음")]
+        robust_fig(cmp, out, [
             ("fu_fusion_md", "cross-attention + modality dropout", BLUE, "-"),
             ("fu_late_md", "단순 결합 + modality dropout", ORANGE, "-"),
             ("fu_fusion_eval", "cross-attention (dropout 없음)", BLUE, ":"),
             ("fu_late_eval", "단순 결합 (dropout 없음)", ORANGE, ":"),
-        ])
+        ], conds=conds)
         print(f"figures in {out}")
         return
     if args.fusion:
