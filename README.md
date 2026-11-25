@@ -43,6 +43,16 @@ Deliberate choices where the paper is silent or the clinical setting differs:
   copying a neighbor; spans make the model infer from other variables and longer
   context. Every evaluation reports both regimes (UniTTab masks and spans), and
   `scripts/eval_ckpt.py` re-scores any checkpoint on val/test with both.
+* **Forecast masking** (optional, `--fore-p`): the last 5–30 rows of a window are hidden
+  (time stays visible), so the model predicts the next minutes from the past only — spans
+  still see both ends of a gap. Evaluation adds a forecast regime (last 15 rows) and a
+  **linear-interpolation** baseline next to `nearest` (under forecast masks both are
+  persistence). `--select all` picks `best.pt` by the mean val loss of the three regimes.
+* **Signal-only profile** (`scripts/derive_subset.py --profile signal`): keeps only values
+  measured from the patient — HR (ECG), SpO2 (PPG), arterial and cuff pressures, EtCO2 /
+  RR (capnogram), temperature, TV / PIP (airway) — the counterparts of the CARMEN waveform
+  channels. Anesthetic drugs (TCI Ce, MAC), BIS, clinician settings (FiO2, PEEP), labs and
+  pre-operative data are dropped. Bin edges are copied, so MAE stays comparable.
 
 ## Layout
 
@@ -54,9 +64,12 @@ carmen_numeric/
   evaluate.py      reconstruction MAE in physical units vs. baselines
   data/vitaldb.py  VitalDB -> rows (static / monitor / lab)
   data/dataset.py  windows, collate, patient split
+  data/subset.py   field profiles (signal-only) and derived caches
 scripts/
   prepare_vitaldb.py   build the row cache (API download or local .vital files)
   pretrain.py          masked-token pre-training (CPU, 1 GPU or torchrun DDP)
+  eval_ckpt.py         score checkpoints on splits / all of VitalDB, three mask regimes
+  derive_subset.py     field-subset cache from a prepared one (no re-parsing)
   orch/orchctl.py      주경야독 GPU API client (from Biosignal-Foundation-Model)
   orch/node_pretrain.sh  prepare + train on the GPU node
 tests/

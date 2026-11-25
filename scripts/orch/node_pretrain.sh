@@ -7,6 +7,8 @@
 #   python scripts/orch/orchctl.py up --gpus 1            # GPU session for training
 #   STEP=train ...
 #   STEP=eval CKPTS="runs/a/best.pt runs/b/best.pt" SPLIT=all   # score on all of VitalDB
+#   STEP=subset PROFILE=signal  # derive $ROOT/data/vitaldb_<profile> from $DATA (no re-parsing)
+#   then train / eval with DATA=$ROOT/data/vitaldb_signal
 #
 # orchctl sends the file through stdin, so set variables by editing the first lines
 # (or `printf 'export STEP=train\n' | cat - node_pretrain.sh > /tmp/x.sh` and runfile that).
@@ -32,7 +34,8 @@ BATCH="${BATCH:-128}"
 LR="${LR:-2e-4}"
 RUN="${RUN:-unittab_${PRESET}_$(date +%Y%m%d_%H%M)}"
 EXTRA="${EXTRA:-}"   # extra pretrain.py flags, e.g. "--span-p 0.2"
-SPLIT="${SPLIT:-all}"  # eval: train | val | test | all
+SPLIT="${SPLIT:-all}"  # eval: train | val | test | all | heldout
+PROFILE="${PROFILE:-signal}"  # subset: field profile (carmen_numeric/data/subset.py)
 CKPTS="${CKPTS:-runs/unittab_base_v2/best.pt runs/unittab_base_span_v1/best.pt}"  # under ROOT
 # HOME is the per-session workspace; keep caches with the persistent files
 export XDG_CACHE_HOME="$BASE/.cache" PIP_CACHE_DIR="$BASE/.cache/pip" TORCH_HOME="$BASE/.cache/torch"
@@ -57,6 +60,14 @@ prep)
       --vital-dir "$VITAL_DIR" --cases-csv "$CASES_CSV" --labs-csv "$LABS_CSV" \
       --workers "$PREP_WORKERS" > "$LOG" 2>&1 < /dev/null & )
   echo "prep started; log: $LOG"
+  ;;
+subset)
+  [ -f "$DATA/normalizer.json" ] || { echo "no cache at $DATA — run STEP=prep first"; exit 1; }
+  DST="$ROOT/data/vitaldb_$PROFILE"
+  LOG="$ROOT/logs/subset_${PROFILE}_$(date +%Y%m%d_%H%M).log"
+  ( cd "$CODE" && setsid nohup "$PY" scripts/derive_subset.py --src "$DATA" --dst "$DST" \
+      --profile "$PROFILE" > "$LOG" 2>&1 < /dev/null & )
+  echo "subset started -> $DST; log: $LOG"
   ;;
 train)
   [ -f "$DATA/normalizer.json" ] || { echo "no cache at $DATA — run STEP=prep first"; exit 1; }
@@ -86,6 +97,6 @@ eval)
   echo "eval started; log: $LOG"
   ;;
 *)
-  echo "unknown STEP=$STEP (code | prep | train | eval)"; exit 1
+  echo "unknown STEP=$STEP (code | prep | subset | train | eval)"; exit 1
   ;;
 esac

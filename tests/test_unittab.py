@@ -261,3 +261,113 @@ def test_device_eval_windows_cover_every_row_once():
     both = combine([r1, r1])
     assert both["mae"]["a"]["n"] == 2 * r1["mae"]["a"]["n"]
     assert abs(both["mae"]["a"]["model"] - r1["mae"]["a"]["model"]) < 1e-9
+
+
+def test_forecast_mask_rules():
+    from carmen_numeric import ForecastMaskConfig, sample_forecast_mask
+
+    s = toy_schema()
+    _, batch = _batch(s, max_rows=40)
+    is_time = torch.tensor([False] + [f.is_time for f in s.fields])
+    cfg = ForecastMaskConfig(p=1.0, min_len=6, max_len=6)
+    m = sample_forecast_mask(batch, is_time, cfg, torch.tensor([1]),
+                             generator=torch.Generator().manual_seed(0))
+    assert not m[:, 0].any()  # static row stays visible
+    assert not (m & is_time[batch["field_id"]]).any()  # time stays visible
+    assert not (m & batch["missing"]).any()
+    vis = (batch["field_id"] > 0) & ~batch["missing"] & ~is_time[batch["field_id"]]
+    for i in range(m.shape[0]):
+        dyn = torch.nonzero(batch["row_type"][i] == 2).flatten()
+        n = min(6, len(dyn) // 2)
+        hidden, shown = dyn[len(dyn) - n:], dyn[: len(dyn) - n]
+        assert torch.equal(m[i, hidden], vis[i, hidden])  # every value of the last n rows
+        assert not m[i, shown].any()  # nothing before them
+    off = sample_forecast_mask(batch, is_time, ForecastMaskConfig(p=0.0), torch.tensor([1]))
+    assert not off.any()
+
+
+def test_linear_interpolation_baseline():
+    from carmen_numeric.evaluate import neighbor_values
+
+    raw = torch.tensor([[[10.0], [0.0], [0.0], [0.0], [50.0]]])
+    fid = torch.ones(1, 5, 1, dtype=torch.long)
+    vis = torch.tensor([[[True], [False], [False], [False], [True]]])
+    b, t = torch.zeros(3, dtype=torch.long), torch.tensor([1, 2, 3])
+    near, lin = neighbor_values(raw, fid, vis, 1, b, t)
+    assert near.tolist() == [10.0, 10.0, 50.0]
+    assert torch.allclose(lin, torch.tensor([20.0, 30.0, 40.0]))
+    times = torch.tensor([[0.0, 1.0, 2.0, 3.0, 8.0]])  # uneven row times
+    _, lin = neighbor_values(raw, fid, vis, 1, b, t, times)
+    assert torch.allclose(lin, torch.tensor([15.0, 20.0, 25.0]))
+    vis_past = torch.tensor([[[True], [False], [False], [False], [False]]])  # forecast
+    near, lin = neighbor_values(raw, fid, vis_past, 1, b, t)
+    assert near.tolist() == lin.tolist() == [10.0, 10.0, 10.0]  # persistence
+
+
+def test_subset_cache(tmp_path):
+    from carmen_numeric.data.subset import derive_subset, subset_case, subset_schema
+
+    s = TableSchema(
+        fields=[
+            Field("t_min", "num", is_time=True),
+            Field("dt_min", "num", is_time=True),
+            Field("hr", "num"),
+            Field("drug", "num"),
+            Field("lab_k", "num"),
+            Field("age", "num"),
+        ],
+        row_types=[
+            RowType("static", ("age",)),
+            RowType("monitor", ("t_min", "dt_min", "hr", "drug")),
+            RowType("lab", ("t_min", "dt_min", "lab_k")),
+        ],
+    )
+    new = subset_schema(s, ["hr"])
+    assert [rt.name for rt in new.row_types] == ["monitor"]
+    assert [f.name for f in new.fields] == ["t_min", "dt_min", "hr"]
+    nan = np.nan
+    values = np.array([
+        [60, nan, nan, nan],  # static
+        [0, 0, 80, 1.0],  # monitor
+        [1, 1, nan, 2.0],  # monitor, only the drug -> dropped
+        [1.5, 0.5, 4.1, nan],  # lab -> dropped
+        [3, 1.5, 82, nan],  # monitor
+    ], dtype=np.float32)
+    rt = np.array([1, 2, 2, 3, 2], dtype=np.int8)
+    v, t = subset_case(values, rt, s, new)
+    assert t.tolist() == [1, 1]
+    assert np.allclose(v[:, 0], [0, 3]) and np.allclose(v[:, 1], [0, 3])  # dt recomputed
+    assert np.allclose(v[:, 2], [80, 82])
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "cases").mkdir(parents=True)
+    s.save(src / "schema.json")
+    cases = {7: {"values": values, "row_type": rt.astype(np.int64), "subjectid": 7}}
+    from carmen_numeric.data.dataset import collect_field_values, load_cases
+
+    norm = Normalizer.fit(s, collect_field_values(cases, s), {}, num_bins=4)
+    norm.save(src / "normalizer.json")
+    np.savez_compressed(src / "cases" / "7.npz", values=values, row_type=rt, subjectid=7)
+    info = derive_subset(src, dst, ["hr"])
+    assert info["rows_after"] == 2
+    new_norm = Normalizer.load(TableSchema.load(dst / "schema.json"), dst / "normalizer.json")
+    assert np.array_equal(new_norm.numeric[3].edges, norm.numeric[3].edges)  # hr bins kept
+    loaded = load_cases(dst)
+    assert loaded[7]["subjectid"] == 7 and loaded[7]["values"].shape == (2, 3)
+
+
+def test_evaluate_forecast_regime():
+    from carmen_numeric import ForecastMaskConfig
+    from carmen_numeric.data.dataset import GPUWindowBatcher
+    from carmen_numeric.evaluate import evaluate
+
+    s = toy_schema()
+    cases = toy_cases(s, n_rows=37)
+    norm = toy_normalizer(s, cases)
+    dev = torch.device("cpu")
+    it = GPUWindowBatcher(cases, norm, 16, (1,), dev, keep_raw=True).eval_batches(4)
+    r = evaluate(toy_model(s, norm), it, norm, dev, context_row_types=(1,),
+                 forecast=ForecastMaskConfig(1.0, 3, 3))
+    a = r["mae"]["a"]
+    assert a["n"] > 0 and abs(a["nearest"] - a["linear"]) < 1e-9  # both = persistence
+    assert r["n_cat"] == 0  # the static row is never hidden

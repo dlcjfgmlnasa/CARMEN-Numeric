@@ -34,12 +34,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from carmen_numeric import (  # noqa: E402
     PRESETS,
+    ForecastMaskConfig,
     Normalizer,
     SpanMaskConfig,
     TableSchema,
     UniTTab,
     UniTTabConfig,
     masked_token_loss,
+    sample_forecast_mask,
     sample_mask,
     sample_span_mask,
 )
@@ -53,8 +55,8 @@ from carmen_numeric.data.dataset import (  # noqa: E402
 from carmen_numeric.data.vitaldb import POINT_DECODE  # noqa: E402
 from carmen_numeric.evaluate import evaluate, summarize_mae  # noqa: E402
 
-KEY_FIELDS = ["hr", "spo2", "art_mbp", "nibp_mbp", "etco2", "bis", "bt", "ppf_ce", "lab_k",
-              "lab_hct", "lab_gluc", "lab_lac", "age", "weight", "preop_cr"]
+KEY_FIELDS = ["hr", "spo2", "art_mbp", "nibp_mbp", "etco2", "rr", "bis", "bt", "tv", "ppf_ce",
+              "lab_k", "lab_hct", "lab_gluc", "lab_lac", "age", "weight", "preop_cr"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,6 +83,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--span-field-prob", type=float, default=0.5)
     ap.add_argument("--span-mask-time", action="store_true",
                     help="also hide the time fields of spanned rows")
+    ap.add_argument("--fore-p", type=float, default=0.0,
+                    help="forecast masking: probability that a window hides its last rows")
+    ap.add_argument("--fore-min", type=int, default=5)
+    ap.add_argument("--fore-max", type=int, default=30)
+    ap.add_argument("--select", default="unittab", choices=["unittab", "span", "forecast", "all"],
+                    help="val loss that picks best.pt (all = mean of the three regimes)")
     ap.add_argument("--windows-per-case", type=int, default=4)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--data-on-device", action="store_true",
@@ -204,8 +212,10 @@ def main() -> None:
     ctx_types = torch.tensor(ctx, dtype=torch.long, device=device)
     span_cfg = SpanMaskConfig(args.span_p, args.span_min, args.span_max, args.span_field_prob,
                               keep_time=not args.span_mask_time)
-    # fixed gap-filling regime for evaluation, the same for every run
+    fore_cfg = ForecastMaskConfig(args.fore_p, args.fore_min, args.fore_max)
+    # fixed gap-filling / forecasting regimes for evaluation, the same for every run
     eval_span = SpanMaskConfig(0.2, 5, 30, 0.5, keep_time=True)
+    eval_fore = ForecastMaskConfig(1.0, 15, 15)
 
     if is_main:
         print(f"device={device} world={world} params={n_params / 1e6:.2f}M "
@@ -229,6 +239,8 @@ def main() -> None:
         masked = sample_mask(b, is_time, args.p_field, args.p_row, generator=mask_gen)
         if span_cfg.p > 0:
             masked |= sample_span_mask(b, is_time, span_cfg, ctx_types, generator=mask_gen)
+        if fore_cfg.p > 0:
+            masked |= sample_forecast_mask(b, is_time, fore_cfg, ctx_types, generator=mask_gen)
         for g in opt.param_groups:
             g["lr"] = lr_at(step, args)
         with torch.autocast(device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
@@ -265,18 +277,29 @@ def main() -> None:
                                    radius=args.radius, max_batches=args.eval_batches,
                                    amp_dtype=amp_dtype, span=eval_span, context_row_types=ctx,
                                    point_decode=POINT_DECODE)
+                ev_fore = evaluate(model, val_dl, norm, device, eps=args.eps,
+                                   radius=args.radius, max_batches=args.eval_batches,
+                                   amp_dtype=amp_dtype, forecast=eval_fore,
+                                   context_row_types=ctx, point_decode=POINT_DECODE)
                 head = {k: ev[k] for k in ("loss", "acc_num", "acc_num_pm2", "acc_cat")}
                 head["span_loss"] = ev_span["loss"]
+                head["fore_loss"] = ev_fore["loss"]
+                sel = {"unittab": ev["loss"], "span": ev_span["loss"],
+                       "forecast": ev_fore["loss"]}
+                head["select"] = sel[args.select] if args.select != "all" \
+                    else sum(sel.values()) / 3
                 print(f"[eval step {step}] {json.dumps(head)}")
                 print("  masks: UniTTab (field/row)")
                 print(summarize_mae(ev["mae"], KEY_FIELDS))
                 print("  masks: spans (gap filling)")
-                print(summarize_mae(ev_span["mae"], KEY_FIELDS), flush=True)
+                print(summarize_mae(ev_span["mae"], KEY_FIELDS))
+                print("  masks: forecast (last 15 rows)")
+                print(summarize_mae(ev_fore["mae"], KEY_FIELDS), flush=True)
                 log_f.write(json.dumps({"split": "val", "step": step, **ev,
-                                        "span": ev_span}) + "\n")
+                                        "span": ev_span, "forecast": ev_fore}) + "\n")
                 log_f.flush()
-                if ev["loss"] < best:
-                    best = ev["loss"]
+                if head["select"] < best:
+                    best = head["select"]
                     save("best", {"val": head})
                 save("last", {"val": head})
             if world > 1:
@@ -284,7 +307,8 @@ def main() -> None:
 
     if is_main:
         log_f.close()
-        print(f"finished {step} steps in {time.time() - t0:.0f}s; best val loss {best:.4f}")
+        print(f"finished {step} steps in {time.time() - t0:.0f}s; "
+              f"best val loss ({args.select}) {best:.4f}")
     if world > 1:
         dist.destroy_process_group()
 

@@ -397,6 +397,53 @@ def sample_span_mask(
     return m & (fid > 0) & ~batch["missing"]
 
 
+@dataclass
+class ForecastMaskConfig:
+    """Hide the last rows of a window: predict the next minutes from the past only.
+
+    Span masks still see both ends of a gap (interpolation); this regime does not.
+
+    p:               probability that a sequence gets a forecast mask (0 disables).
+    min_len/max_len: number of final dynamic rows hidden (uniform), at most half of the
+                     sequence's dynamic rows.
+    keep_time:       leave the time fields visible (the model knows *when* to predict).
+    """
+
+    p: float = 0.0
+    min_len: int = 5
+    max_len: int = 30
+    keep_time: bool = True
+
+
+def sample_forecast_mask(
+    batch: dict[str, torch.Tensor],
+    is_time_field: torch.Tensor,  # (F+1,) bool lookup
+    cfg: ForecastMaskConfig,
+    context_row_types: torch.Tensor | None = None,  # row types never hidden (static)
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """``(B, T, K)`` bool mask hiding every value of the last ``L`` dynamic rows."""
+    fid = batch["field_id"]
+    row_type = batch["row_type"]
+    b, t, _ = fid.shape
+    dev = fid.device
+    if cfg.p <= 0:
+        return torch.zeros_like(fid, dtype=torch.bool)
+    dyn = row_type > 0
+    if context_row_types is not None and context_row_types.numel():
+        dyn &= ~torch.isin(row_type, context_row_types.to(dev))
+    n_dyn = dyn.sum(1)  # (B,)
+    length = torch.randint(cfg.min_len, cfg.max_len + 1, (b,), generator=generator, device=dev)
+    length = torch.minimum(length, n_dyn // 2)
+    on = torch.rand(b, generator=generator, device=dev) < cfg.p
+    rank_from_end = dyn.flip(1).long().cumsum(1).flip(1)  # 1 = last dynamic row
+    rows = dyn & (rank_from_end <= length[:, None]) & on[:, None]  # (B, T)
+    m = rows[..., None].expand_as(fid)
+    if cfg.keep_time:
+        m = m & ~is_time_field.to(dev)[fid]
+    return m & (fid > 0) & ~batch["missing"]
+
+
 def soft_targets(
     target: torch.Tensor, vocab: int, kind: str, eps: float = 0.1, radius: int = 5
 ) -> torch.Tensor:
