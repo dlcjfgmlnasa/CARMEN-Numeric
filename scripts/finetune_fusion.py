@@ -18,10 +18,13 @@ waveform tokens. CARMEN stays frozen. The step with the best mean val AUROC is k
 metrics, curves and logits (``test_scores.npz``) are written.
 
 Missing modalities: ``--drop-wave`` / ``--drop-signal`` hide all waveform tokens of a sample
-/ the tokens of one signal at random during training (modality dropout). Test scores are also
-computed with waveforms removed (``no_wave``), without the arterial waveform (``no_abp``:
-ECG + PPG, as without an arterial line) and with the arterial waveform alone (``abp_only``);
-``--eval-only CKPT`` scores an existing ``best.pt`` under those conditions without training.
+/ the tokens of one signal at random during training (modality dropout); ``--subset-train``
+draws a signal subset per sample instead. Test scores are computed for every signal subset
+(``eap``, ``ea``, ``ep`` = no arterial line, ``ap``, ``e``, ``a``, ``p``, ``none``). With
+``--token-mode joint`` subsets are made by masking tokens of a joint encoding (leaky: the kept
+tokens saw the other signals); ``subsets`` uses a separate CARMEN encoding per subset and
+``independent`` single-signal encodings (both exact). ``--eval-only CKPT`` scores an existing
+``best.pt`` without training.
 """
 from __future__ import annotations
 
@@ -49,21 +52,80 @@ from carmen_numeric.data.dataset import load_cases  # noqa: E402
 
 N_SIG, N_CHUNK = 3, 12
 SLOT = {"ecg": 0, "abp": 1, "ppg": 2}  # token slots = CARMEN signal types
-CONDITIONS = ("full", "no_wave", "no_abp", "abp_only")
+# signal subsets as bitmasks (ECG 1, ABP 2, PPG 4) and their token-file names
+SUBSET_NAME = {1: "e", 2: "a", 3: "ea", 4: "p", 5: "ep", 6: "ap", 7: "eap"}
+COND_MASK = {"eap": 7, "ea": 3, "ep": 5, "ap": 6, "e": 1, "a": 2, "p": 4, "none": 0}
+CONDITIONS = tuple(COND_MASK)
+ALIASES = {"full": "eap", "no_wave": "none", "no_abp": "ep", "abp_only": "a"}
+
+
+def slot_mask(bits: torch.Tensor) -> torch.Tensor:  # (B,) bitmask -> (B, 36) allowed slots
+    sig = torch.stack([(bits >> k) & 1 for k in range(N_SIG)], -1).bool()  # (B, 3)
+    return sig[..., None].expand(-1, -1, N_CHUNK).reshape(len(bits), N_SIG * N_CHUNK)
 
 
 def apply_condition(valid: torch.Tensor, cond: str) -> torch.Tensor:  # (B, 36) -> (B, 36)
-    v = valid.clone().view(-1, N_SIG, N_CHUNK)
-    if cond == "no_wave":
-        v[:] = False
-    elif cond == "no_abp":
-        v[:, SLOT["abp"]] = False
-    elif cond == "abp_only":
-        v[:, SLOT["ecg"]] = False
-        v[:, SLOT["ppg"]] = False
-    elif cond != "full":
-        raise ValueError(cond)
-    return v.view(-1, N_SIG * N_CHUNK)
+    """Mask-based condition (on jointly encoded tokens this leaks — see TokenSource)."""
+    bits = torch.full((len(valid),), COND_MASK[ALIASES.get(cond, cond)], device=valid.device)
+    return valid & slot_mask(bits)
+
+
+class TokenSource:
+    """CARMEN tokens of one split; ``get(idx, bits)`` gives tokens of a signal subset.
+
+    ``joint``: one joint encoding of all signals; subsets by masking tokens (other signals'
+    information stays in the kept tokens). ``subsets``: a separate encoding per subset
+    (``<split>_<subset>_tokens.npy`` from ``extract_carmen_tokens.py --subsets all``) —
+    exact. ``independent``: the single-signal encodings side by side; subsets by masking,
+    exact because no signal saw another.
+    """
+
+    def __init__(self, path: Path, part: str, samples: dict, device, mode: str) -> None:
+        meta = np.load(path / f"{part}_meta.npz")
+        if not (np.array_equal(meta["caseid"], samples["caseid"])
+                and np.allclose(meta["t"], samples["t"])):
+            raise ValueError(f"{part}: token order does not match the samples")
+        load = lambda name: (  # noqa: E731
+            torch.from_numpy(np.load(path / f"{name}_tokens.npy")).to(device),
+            torch.from_numpy(np.load(path / f"{name}_valid.npy")).to(device))
+        self.mode = mode
+        if mode == "joint":
+            self.tok, self.valid = load(part)
+        elif mode == "independent":
+            parts = [load(f"{part}_{k}") for k in ("e", "a", "p")]
+            self.tok = parts[0][0] + parts[1][0] + parts[2][0]  # slot-disjoint, zeros elsewhere
+            self.valid = parts[0][1] | parts[1][1] | parts[2][1]
+        elif mode == "subsets":
+            loaded = [load(f"{part}_{SUBSET_NAME[b]}") for b in range(1, 8)]
+            self.tok_all = torch.stack([t for t, _ in loaded])  # (7, n, 36, d)
+            self.valid_all = torch.stack([v for _, v in loaded])
+            self.tok, self.valid = self.tok_all[6], self.valid_all[6]  # all signals
+        else:
+            raise ValueError(mode)
+        sig = self.valid.view(-1, N_SIG, N_CHUNK).any(-1)  # (n, 3) signal present
+        self.present_bits = (sig.long() * torch.tensor([1, 2, 4], device=device)).sum(-1)
+
+    def get(self, idx: torch.Tensor, bits: torch.Tensor | None = None
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+        if bits is None:
+            return self.tok[idx], self.valid[idx]
+        bits = bits & self.present_bits[idx]
+        if self.mode != "subsets":
+            return self.tok[idx], self.valid[idx] & slot_mask(bits)
+        k = (bits - 1).clamp(min=0)
+        tok, valid = self.tok_all[k, idx], self.valid_all[k, idx]
+        return tok, valid & (bits > 0)[:, None]
+
+
+def sample_subsets(present: torch.Tensor, p_full: float, p_none: float,
+                   gen: torch.Generator) -> torch.Tensor:
+    """Per-sample signal subset for training: all available signals with ``p_full``, none
+    with ``p_none``, otherwise a random non-empty subset of the available ones."""
+    b = len(present)
+    u = torch.rand(b, generator=gen, device=present.device)
+    r = torch.randint(1, 8, (b,), generator=gen, device=present.device) & present
+    r = torch.where(r == 0, present, r)
+    return torch.where(u < p_full, present, torch.where(u > 1 - p_none, torch.zeros_like(r), r))
 
 
 def modality_dropout(valid: torch.Tensor, p_wave: float, p_signal: float,
@@ -151,25 +213,20 @@ class FusionModel(nn.Module):
         return self.head(self.cross(q, mem, pad).flatten(1))
 
 
-def load_tokens(path: Path, part: str, samples: dict, device) -> tuple[torch.Tensor, torch.Tensor]:
-    meta = np.load(path / f"{part}_meta.npz")
-    if not (np.array_equal(meta["caseid"], samples["caseid"])
-            and np.allclose(meta["t"], samples["t"])):
-        raise ValueError(f"{part}: token order does not match the samples")
-    tok = torch.from_numpy(np.load(path / f"{part}_tokens.npy")).to(device)
-    valid = torch.from_numpy(np.load(path / f"{part}_valid.npy")).to(device)
-    return tok, valid
-
-
 @torch.no_grad()
-def predict(model, win, tok, valid, n, device, batch_size=512) -> np.ndarray:
+def predict_cond(model, win, src: TokenSource, cond: str, n: int, device,
+                 batch_size: int = 512) -> np.ndarray:
+    """Logits with the tokens of one signal subset (condition name or alias)."""
     model.eval()
     out = []
+    bits_all = COND_MASK[ALIASES.get(cond, cond)]
     for s in range(0, n, batch_size):
         idx = torch.arange(s, min(s + batch_size, n), device=device)
+        bits = torch.full((len(idx),), bits_all, device=device, dtype=torch.long)
+        tok, valid = src.get(idx, bits)
         b = win.batch(idx) if win is not None else None
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            out.append(model(b, tok[idx], valid[idx]).float().cpu())
+            out.append(model(b, tok, valid).float().cpu())
     model.train()
     return torch.cat(out).numpy()
 
@@ -198,6 +255,12 @@ def main() -> None:
                     help="training: probability of hiding one signal's tokens")
     ap.add_argument("--eval-only", default=None,
                     help="best.pt of an earlier run: skip training, score test conditions")
+    ap.add_argument("--token-mode", default="joint", choices=["joint", "subsets", "independent"])
+    ap.add_argument("--subset-train", nargs=2, type=float, default=None,
+                    metavar=("P_FULL", "P_NONE"),
+                    help="training: per-sample random signal subsets (instead of --drop-*)")
+    ap.add_argument("--select-conds", nargs="+", default=["eap"],
+                    help="val conditions whose mean AUROC picks the checkpoint")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -214,9 +277,9 @@ def main() -> None:
     samples = {p: P.build_samples(load_cases(label_data, ids[p]), lschema, F.HORIZONS, 5, 15.0)
                for p in P.PARTS}
     counts = {p: len(samples[p]["t"]) for p in P.PARTS}
-    toks = {p: load_tokens(tok_dir, p, samples[p], device) for p in P.PARTS}
-    d_carmen = toks["train"][0].shape[-1]
-    wave_rate = {p: float(toks[p][1].any(1).float().mean()) for p in P.PARTS}
+    toks = {p: TokenSource(tok_dir, p, samples[p], device, args.token_mode) for p in P.PARTS}
+    d_carmen = toks["train"].tok.shape[-1]
+    wave_rate = {p: float(toks[p].valid.any(1).float().mean()) for p in P.PARTS}
     print(f"samples {counts}; with waveform {wave_rate} ({time.time() - t0:.0f}s)", flush=True)
 
     encoder = P.load_model(args.ckpt, device)
@@ -251,9 +314,14 @@ def main() -> None:
         yy = y["train"][idx]
         ok = ~torch.isnan(yy)
         b = win["train"].batch(idx) if win["train"] is not None else None
-        tv = modality_dropout(toks["train"][1][idx], args.drop_wave, args.drop_signal, gen)
+        if args.subset_train:
+            bits = sample_subsets(toks["train"].present_bits[idx], *args.subset_train, gen)
+            tt, tv = toks["train"].get(idx, bits)
+        else:
+            tt, tv = toks["train"].get(idx)
+            tv = modality_dropout(tv, args.drop_wave, args.drop_signal, gen)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logit = model(b, toks["train"][0][idx], tv).float()
+            logit = model(b, tt, tv).float()
         loss = nn.functional.binary_cross_entropy_with_logits(logit[ok],
                                                               torch.nan_to_num(yy)[ok])
         opt.zero_grad(set_to_none=True)
@@ -261,8 +329,10 @@ def main() -> None:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if step % args.eval_every == 0 or step == args.steps:
-            va = F.mean_auroc(samples["val"]["y"], predict(model, win["val"], *toks["val"],
-                                                           counts["val"], device))
+            va = float(np.mean([
+                F.mean_auroc(samples["val"]["y"], predict_cond(model, win["val"], toks["val"],
+                                                               c, counts["val"], device))
+                for c in args.select_conds]))
             log.append({"step": step, "loss": round(loss.item(), 4), "val_auroc": round(va, 4)})
             print(json.dumps(log[-1]) + f" ({time.time() - t0:.0f}s)", flush=True)
             if va > best:
@@ -278,14 +348,13 @@ def main() -> None:
     te = samples["test"]
     cond_logits = {}
     for cond in CONDITIONS:
-        cv = apply_condition(toks["test"][1], cond)
-        cond_logits[cond] = predict(model, win["test"], toks["test"][0], cv, counts["test"],
-                                    device)
+        cond_logits[cond] = predict_cond(model, win["test"], toks["test"], cond,
+                                         counts["test"], device)
         np.savez(out / f"test_scores_{cond}.npz", logit=cond_logits[cond], caseid=te["caseid"],
-                 t=te["t"], has_wave=cv.any(1).cpu().numpy())
-    logit = cond_logits["full"]
+                 t=te["t"])
+    logit = cond_logits["eap"]
     np.savez(out / "test_scores.npz", logit=logit, caseid=te["caseid"], t=te["t"],
-             has_wave=toks["test"][1].any(1).cpu().numpy())
+             has_wave=toks["test"].valid.any(1).cpu().numpy())
 
     res: dict = {"mode": args.mode, "best_step": best_step, "best_val_auroc": round(best, 4),
                  "log": log, "counts": counts, "with_waveform": wave_rate, "args": vars(args),

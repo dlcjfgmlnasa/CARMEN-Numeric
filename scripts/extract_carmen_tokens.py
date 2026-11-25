@@ -14,7 +14,9 @@ holds nothing after ``t``. Arterial pressure, ECG lead II and PPG (``SNUADC/ART`
 a sample when > 30 % of its window is missing or flat; small gaps are interpolated.
 ``--signals`` restricts what CARMEN sees: since the signals of a sample are encoded jointly,
 masking one signal's tokens afterwards still leaves its information in the others' tokens —
-to emulate a missing arterial line, re-encode with ``--signals ecg ppg``.
+to emulate a missing arterial line, re-encode with ``--signals ecg ppg``. ``--subsets all``
+encodes every non-empty subset of the three signals on its own in one pass (the waveforms
+are read and filtered once); the single-signal subsets are independent encodings.
 
 CARMEN (frozen, ``task="masked"``, any-variate packing: the three signals of a sample attend
 to each other) encodes 240 patches (0.25 s) per signal; patches are mean-pooled into 5 s
@@ -211,19 +213,37 @@ def _stack_batches(rows: list):
     )
 
 
-class TokenWriter:
-    """Buffers per-case waveforms, runs CARMEN in batches, writes into a .npy memmap."""
+# signal subsets by name (slot 0 = ECG, 1 = ABP, 2 = PPG)
+SUBSETS = {"e": (0,), "a": (1,), "p": (2,), "ea": (0, 1), "ep": (0, 2), "ap": (1, 2),
+           "eap": (0, 1, 2)}
 
-    def __init__(self, enc: CarmenEncoder, path: Path, n: int, batch_size: int) -> None:
-        self.enc, self.path, self.n, self.bs = enc, path, n, batch_size
-        self.tokens = None
-        self.valid = np.zeros((n, N_SIG * N_CHUNK), bool)
+
+class TokenWriter:
+    """Buffers per-case waveforms, runs CARMEN in batches, writes .npy memmaps.
+
+    ``outputs`` maps a file prefix to the signal slots CARMEN may see for it: one entry
+    (``"<split>"``) for the default joint encoding, or one per signal subset
+    (``"<split>_<subset>"``) so that each subset is encoded on its own.
+    """
+
+    def __init__(self, enc: CarmenEncoder, out: Path, outputs: dict[str, tuple[int, ...]],
+                 n: int, batch_size: int) -> None:
+        self.enc, self.out, self.outputs, self.n, self.bs = enc, out, outputs, n, batch_size
+        self.tokens: dict[str, np.ndarray] = {}
+        self.valid = {k: np.zeros((n, N_SIG * N_CHUNK), bool) for k in outputs}
         self.buf: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
     def add(self, wave: np.ndarray, present: np.ndarray, idx: np.ndarray) -> None:
         self.buf.append((wave, present, idx))
         if sum(len(b[2]) for b in self.buf) >= 8 * self.bs:
             self.flush()
+
+    def _memmap(self, prefix: str) -> np.ndarray:
+        if prefix not in self.tokens:
+            self.tokens[prefix] = np.lib.format.open_memmap(
+                self.out / f"{prefix}_tokens.npy", mode="w+", dtype=np.float16,
+                shape=(self.n, N_SIG * N_CHUNK, self.enc.d))
+        return self.tokens[prefix]
 
     def flush(self) -> None:
         if not self.buf:
@@ -232,17 +252,22 @@ class TokenWriter:
         p = np.concatenate([b[1] for b in self.buf])
         ii = np.concatenate([b[2] for b in self.buf])
         self.buf.clear()
-        for s0 in range(0, len(w), self.bs):
-            sl = slice(s0, s0 + self.bs)
-            tk, vl = self.enc(w[sl], p[sl])
-            if tk is None:
-                continue
-            if self.tokens is None:
-                self.tokens = np.lib.format.open_memmap(
-                    self.path, mode="w+", dtype=np.float16,
-                    shape=(self.n, N_SIG * N_CHUNK, self.enc.d))
-            self.tokens[ii[sl]] = tk
-            self.valid[ii[sl]] = vl
+        for prefix, slots in self.outputs.items():
+            allow = np.zeros(N_SIG, bool)
+            allow[list(slots)] = True
+            for s0 in range(0, len(w), self.bs):
+                sl = slice(s0, s0 + self.bs)
+                tk, vl = self.enc(w[sl], p[sl] & allow)
+                if tk is None:
+                    continue
+                self._memmap(prefix)[ii[sl]] = tk
+                self.valid[prefix][ii[sl]] = vl
+
+    def close(self) -> None:
+        self.flush()
+        for prefix in self.outputs:
+            self._memmap(prefix).flush()  # creates an all-invalid file if nothing was written
+            np.save(self.out / f"{prefix}_valid.npy", self.valid[prefix])
 
 
 def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0: float) -> None:
@@ -263,7 +288,12 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
         jobs.append((int(c), ends[m], args.vital_dir, keep))
         offsets.append(pos)
         pos += len(m)
-    writer = TokenWriter(enc, out / f"{part}_tokens.npy", n, args.batch_size)
+    if args.subsets:
+        subsets = list(SUBSETS) if args.subsets == ["all"] else args.subsets
+        outputs = {f"{part}_{k}": SUBSETS[k] for k in subsets}
+    else:
+        outputs = {part: keep}
+    writer = TokenWriter(enc, out, outputs, n, args.batch_size)
     present = np.zeros((n, N_SIG), bool)
     with Pool(args.workers) as pool:
         results = pool.imap(case_windows, jobs, chunksize=2)
@@ -272,17 +302,11 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
             writer.add(w, p, np.arange(off, off + len(w)))
             if k % 200 == 0:
                 print(f"[{part}] {k}/{len(jobs)} cases ({time.time() - t0:.0f}s)", flush=True)
-    writer.flush()
-    if writer.tokens is None:  # no waveform in this split: all tokens invalid
-        writer.tokens = np.lib.format.open_memmap(out / f"{part}_tokens.npy", mode="w+",
-                                                  dtype=np.float16,
-                                                  shape=(n, N_SIG * N_CHUNK, enc.d))
-    writer.tokens.flush()
-    np.save(out / f"{part}_valid.npy", writer.valid)
+    writer.close()
     np.savez(out / f"{part}_meta.npz", caseid=s["caseid"], t=s["t"], present=present)
     print(f"[{part}] {n} samples; signals present ECG/ABP/PPG = "
-          f"{present.mean(0).round(3).tolist()}; any = {present.any(1).mean():.3f} "
-          f"({time.time() - t0:.0f}s)", flush=True)
+          f"{present.mean(0).round(3).tolist()}; any = {present.any(1).mean():.3f}; "
+          f"outputs {list(outputs)} ({time.time() - t0:.0f}s)", flush=True)
 
 
 def main() -> None:
@@ -300,6 +324,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--max-cases", type=int, default=None)
     ap.add_argument("--splits", nargs="+", default=list(P.PARTS))
+    ap.add_argument("--subsets", nargs="+", default=None,
+                    help="encode each signal subset separately: names from "
+                         f"{list(SUBSETS)} or 'all'; writes <split>_<subset>_tokens.npy")
     ap.add_argument("--signals", nargs="+", default=["ecg", "abp", "ppg"],
                     choices=["ecg", "abp", "ppg"],
                     help="signals given to CARMEN (others are treated as absent), e.g. "
