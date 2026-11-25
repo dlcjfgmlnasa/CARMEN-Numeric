@@ -7,7 +7,8 @@
 
 Scores every method on the test samples of ``probe_ioh.py`` (current MAP, hand-made
 features + GBM, frozen encoder + logistic regression, fine-tuned models from
-``finetune_ioh.py``) and bootstraps test patients once for all methods, so differences
+``finetune_ioh.py``, precomputed logits such as ``finetune_fusion.py``'s
+``test_scores.npz``) and bootstraps test patients once for all methods, so differences
 in AUROC / AUPRC come with paired 95 % intervals (reference: ``--reference``).
 """
 from __future__ import annotations
@@ -68,6 +69,9 @@ def main() -> None:
     ap.add_argument("--label-data", required=True)
     ap.add_argument("--finetuned", nargs=2, action="append", default=[],
                     metavar=("NAME", "CKPT"))
+    ap.add_argument("--scores", nargs=2, action="append", default=[],
+                    metavar=("NAME", "NPZ"),
+                    help="precomputed test logits (test_scores.npz of finetune_fusion.py)")
     ap.add_argument("--frozen", nargs=2, default=None, metavar=("NAME", "CKPT"),
                     help="pre-trained checkpoint for the frozen-encoder linear probe")
     ap.add_argument("--reference", default="hand_gbm")
@@ -98,6 +102,11 @@ def main() -> None:
                         device)
         logits[name] = F.predict(model, win, n_te, device, 512)
         del model, win
+    for name, path in args.scores:
+        z = np.load(path)
+        if not (np.array_equal(z["caseid"], te["caseid"]) and np.allclose(z["t"], te["t"])):
+            raise ValueError(f"{path}: test samples do not match")
+        logits[name] = z["logit"]
     frozen = None
     if args.frozen:
         fname, fckpt = args.frozen

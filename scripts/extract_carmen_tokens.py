@@ -141,6 +141,9 @@ class CarmenEncoder:
         self.device = device
         self.patch = int(getattr(self.model, "patch_size", 25))
         self.d = None
+        probe = np.zeros((1, N_SIG, N_WIN), np.float32)
+        probe[0, 1] = 80 + 20 * np.sin(np.linspace(0, 120 * np.pi, N_WIN))
+        self(probe, np.array([[False, True, False]]))  # sets self.d
 
     def __call__(self, wave: np.ndarray, present: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(B, 3, N_WIN), (B, 3) -> tokens (B, 36, d) float16, valid (B, 36)."""
@@ -265,8 +268,11 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
             if k % 200 == 0:
                 print(f"[{part}] {k}/{len(jobs)} cases ({time.time() - t0:.0f}s)", flush=True)
     writer.flush()
-    if writer.tokens is not None:
-        writer.tokens.flush()
+    if writer.tokens is None:  # no waveform in this split: all tokens invalid
+        writer.tokens = np.lib.format.open_memmap(out / f"{part}_tokens.npy", mode="w+",
+                                                  dtype=np.float16,
+                                                  shape=(n, N_SIG * N_CHUNK, enc.d))
+    writer.tokens.flush()
     np.save(out / f"{part}_valid.npy", writer.valid)
     np.savez(out / f"{part}_meta.npz", caseid=s["caseid"], t=s["t"], present=present)
     print(f"[{part}] {n} samples; signals present ECG/ABP/PPG = "
