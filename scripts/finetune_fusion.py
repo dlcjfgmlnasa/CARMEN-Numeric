@@ -16,6 +16,12 @@ update them, and an MLP gives one logit per horizon. ``wave``: the same blocks w
 queries and no numeric encoder. ``late``: the numeric features concatenated with mean-pooled
 waveform tokens. CARMEN stays frozen. The step with the best mean val AUROC is kept; test
 metrics, curves and logits (``test_scores.npz``) are written.
+
+Missing modalities: ``--drop-wave`` / ``--drop-signal`` hide all waveform tokens of a sample
+/ the tokens of one signal at random during training (modality dropout). Test scores are also
+computed with waveforms removed (``no_wave``), without the arterial waveform (``no_abp``:
+ECG + PPG, as without an arterial line) and with the arterial waveform alone (``abp_only``);
+``--eval-only CKPT`` scores an existing ``best.pt`` under those conditions without training.
 """
 from __future__ import annotations
 
@@ -42,6 +48,35 @@ from carmen_numeric import TableSchema  # noqa: E402
 from carmen_numeric.data.dataset import load_cases  # noqa: E402
 
 N_SIG, N_CHUNK = 3, 12
+SLOT = {"ecg": 0, "abp": 1, "ppg": 2}  # token slots = CARMEN signal types
+CONDITIONS = ("full", "no_wave", "no_abp", "abp_only")
+
+
+def apply_condition(valid: torch.Tensor, cond: str) -> torch.Tensor:  # (B, 36) -> (B, 36)
+    v = valid.clone().view(-1, N_SIG, N_CHUNK)
+    if cond == "no_wave":
+        v[:] = False
+    elif cond == "no_abp":
+        v[:, SLOT["abp"]] = False
+    elif cond == "abp_only":
+        v[:, SLOT["ecg"]] = False
+        v[:, SLOT["ppg"]] = False
+    elif cond != "full":
+        raise ValueError(cond)
+    return v.view(-1, N_SIG * N_CHUNK)
+
+
+def modality_dropout(valid: torch.Tensor, p_wave: float, p_signal: float,
+                     gen: torch.Generator) -> torch.Tensor:
+    v = valid.clone().view(-1, N_SIG, N_CHUNK)
+    b = v.shape[0]
+    if p_signal > 0:
+        drop = torch.rand(b, N_SIG, generator=gen, device=v.device) < p_signal
+        v &= ~drop[..., None]
+    if p_wave > 0:
+        drop = torch.rand(b, generator=gen, device=v.device) < p_wave
+        v &= ~drop[:, None, None]
+    return v.view(-1, N_SIG * N_CHUNK)
 
 
 class WaveTokens(nn.Module):
@@ -157,6 +192,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-cases", type=int, default=None)
     ap.add_argument("--example-cases", type=int, nargs="*", default=[])
+    ap.add_argument("--drop-wave", type=float, default=0.0,
+                    help="training: probability of hiding all waveform tokens of a sample")
+    ap.add_argument("--drop-signal", type=float, default=0.0,
+                    help="training: probability of hiding one signal's tokens")
+    ap.add_argument("--eval-only", default=None,
+                    help="best.pt of an earlier run: skip training, score test conditions")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -197,7 +238,12 @@ def main() -> None:
     gen = torch.Generator(device=device).manual_seed(args.seed)
     best, best_state, best_step, bad, log = -1.0, None, 0, 0, []
     model.train()
-    for step in range(1, args.steps + 1):
+    if args.eval_only:
+        ck = torch.load(args.eval_only, map_location="cpu", weights_only=False)
+        if ck["mode"] != args.mode:
+            raise ValueError(f"{args.eval_only} is a {ck['mode']} model")
+        best_state, best_step = ck["model"], ck["step"]
+    for step in range(1, 0 if args.eval_only else args.steps + 1):
         f = min(1.0, step / args.warmup) * 0.5 * (1 + math.cos(math.pi * step / args.steps))
         for g, lr in zip(opt.param_groups, base_lr, strict=True):
             g["lr"] = lr * max(f, 0.05)
@@ -205,8 +251,9 @@ def main() -> None:
         yy = y["train"][idx]
         ok = ~torch.isnan(yy)
         b = win["train"].batch(idx) if win["train"] is not None else None
+        tv = modality_dropout(toks["train"][1][idx], args.drop_wave, args.drop_signal, gen)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logit = model(b, toks["train"][0][idx], toks["train"][1][idx]).float()
+            logit = model(b, toks["train"][0][idx], tv).float()
         loss = nn.functional.binary_cross_entropy_with_logits(logit[ok],
                                                               torch.nan_to_num(yy)[ok])
         opt.zero_grad(set_to_none=True)
@@ -228,14 +275,30 @@ def main() -> None:
                     print(f"early stop at {step}", flush=True)
                     break
     model.load_state_dict(best_state)
-    logit = predict(model, win["test"], *toks["test"], counts["test"], device)
     te = samples["test"]
+    cond_logits = {}
+    for cond in CONDITIONS:
+        cv = apply_condition(toks["test"][1], cond)
+        cond_logits[cond] = predict(model, win["test"], toks["test"][0], cv, counts["test"],
+                                    device)
+        np.savez(out / f"test_scores_{cond}.npz", logit=cond_logits[cond], caseid=te["caseid"],
+                 t=te["t"], has_wave=cv.any(1).cpu().numpy())
+    logit = cond_logits["full"]
     np.savez(out / "test_scores.npz", logit=logit, caseid=te["caseid"], t=te["t"],
              has_wave=toks["test"][1].any(1).cpu().numpy())
 
     res: dict = {"mode": args.mode, "best_step": best_step, "best_val_auroc": round(best, 4),
                  "log": log, "counts": counts, "with_waveform": wave_rate, "args": vars(args),
-                 "horizons": {}}
+                 "horizons": {}, "conditions": {}}
+    for cond, lg in cond_logits.items():
+        res["conditions"][cond] = {}
+        for k, h in enumerate(F.HORIZONS):
+            ok = ~np.isnan(te["y"][:, k])
+            res["conditions"][cond][str(h)] = P.bootstrap(
+                te["y"][ok, k], lg[ok, k], te["caseid"][ok], n=500)
+        print(f"[{cond}] " + "  ".join(
+            f"{h}m AUROC {r['auroc']:.3f} AUPRC {r['auprc']:.3f}"
+            for h, r in res["conditions"][cond].items()), flush=True)
     for k, h in enumerate(F.HORIZONS):
         ok = {p: ~np.isnan(samples[p]["y"][:, k]) for p in P.PARTS}
         yt = te["y"][ok["test"], k]
@@ -264,8 +327,9 @@ def main() -> None:
                   for k, h in enumerate(F.HORIZONS)}}
         for c in args.example_cases if (te["caseid"] == c).any()]
     (out / "result.json").write_text(json.dumps(res))
-    torch.save({"model": best_state, "mode": args.mode, "step": best_step, "args": vars(args)},
-               out / "best.pt")
+    if not args.eval_only:
+        torch.save({"model": best_state, "mode": args.mode, "step": best_step,
+                    "args": vars(args)}, out / "best.pt")
     print(f"wrote {out}/result.json ({time.time() - t0:.0f}s)")
 
 
