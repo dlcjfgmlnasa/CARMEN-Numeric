@@ -2,7 +2,8 @@
 
     python scripts/plot_predictions.py viz_signal.json --out figs/
 
-Writes forecast_examples.png, risk_timelines.png, roc.png and lead_error.png.
+Writes forecast_examples.png, risk_timelines.png, roc.png and lead_error.png; with
+``--finetune`` (and ``--scratch``) ft_roc.png and ft_risk_timelines.png instead.
 """
 from __future__ import annotations
 
@@ -180,15 +181,104 @@ def lead_error(d: dict, out: Path) -> None:
     plt.close(fig)
 
 
+def finetune_figs(viz: dict, ft: dict, scratch: dict | None, out: Path) -> None:
+    """ROC / calibration and risk over time: fine-tuned vs. frozen encoder vs. baselines."""
+    hs = list(ft["horizons"])
+    lines = [("finetuned", ft, "사전학습 encoder 미세조정", BLUE, "-")]
+    if scratch is not None:
+        lines.append(("finetuned", scratch, "같은 구조, 처음부터 학습", "#6250d6", "-"))
+    fig, axes = plt.subplots(1, len(hs) + 1, figsize=(4.2 * (len(hs) + 1), 4.4))
+    for ax, h in zip(axes, hs, strict=False):
+        ax.plot([0, 1], [0, 1], color=AXIS, lw=1)
+        for key, src, label, color, ls in lines:
+            m = src["horizons"][h]["methods"][key]
+            ax.plot(arr(m["fpr"]), arr(m["tpr"]), color=color, ls=ls,
+                    label=f"{label}  {m['auroc']:.3f}")
+        fz = viz["probe"][h]["methods"]["encoder"]
+        ax.plot(arr(fz["fpr"]), arr(fz["tpr"]), color=MUTED, ls="-", lw=1.5,
+                label=f"고정 encoder + 선형  {fz['auroc']:.3f}")
+        for key, label, color, ls in METHODS[1:]:
+            m = ft["horizons"][h]["methods"][key]
+            ax.plot(arr(m["fpr"]), arr(m["tpr"]), color=color, ls=ls, lw=1.5,
+                    label=f"{label}  {m['auroc']:.3f}")
+        ax.set_title(f"{h}분 내 저혈압 (발생률 {ft['horizons'][h]['prevalence'] * 100:.1f}%)")
+        ax.set_xlabel("위양성률 (1 - 특이도)")
+        ax.set_aspect("equal")
+        ax.legend(loc="lower right", fontsize=7.5, title="AUROC", title_fontsize=8)
+    axes[0].set_ylabel("민감도")
+    ax = axes[-1]
+    cal = ft["horizons"]["5"]["calibration"]
+    lim = max(max(cal["finetuned"]["pred"]), max(cal["finetuned"]["obs"]), 0.3) * 1.05
+    ax.plot([0, lim], [0, lim], color=AXIS, lw=1)
+    ax.plot(cal["finetuned"]["pred"], cal["finetuned"]["obs"], color=BLUE, marker="o", ms=5,
+            label="미세조정 encoder")
+    ax.plot(cal["hand_gbm"]["pred"], cal["hand_gbm"]["obs"], color=ORANGE, marker="o", ms=5,
+            label="수작업 추세 특징 + GBM")
+    ax.set_xlim(0, lim)
+    ax.set_ylim(0, lim)
+    ax.set_aspect("equal")
+    ax.set_title("보정 (5분, 예측 위험 10분위)")
+    ax.set_xlabel("예측 위험 평균")
+    ax.set_ylabel("실제 발생률")
+    ax.legend(loc="upper left", fontsize=8)
+    fig.suptitle("저혈압 예측 — encoder까지 함께 학습 (test 환자)", color=INK, fontsize=13,
+                 y=1.02)
+    fig.tight_layout()
+    fig.savefig(out / "ft_roc.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+    ex = {e["caseid"]: e for e in viz["examples"]}
+    fx = [e for e in ft["examples"] if e["caseid"] in ex]
+    fig, axes = plt.subplots(2 * len(fx), 1, figsize=(13, 3.3 * len(fx)), squeeze=False,
+                             gridspec_kw={"height_ratios": [2, 1] * len(fx)})
+    for i, e in enumerate(fx):
+        v = ex[e["caseid"]]
+        ax, ar = axes[2 * i, 0], axes[2 * i + 1, 0]
+        t = arr(v["series"]["t"])
+        mp = arr(v["series"]["art_mbp"])
+        ax.plot(t, mp, color=INK2, lw=1.4)
+        low = mp < 65
+        ax.scatter(t[low], mp[low], color=CRITICAL, s=10, zorder=3, label="65 미만")
+        ax.axhline(65, color=CRITICAL, lw=1, ls="--")
+        for o in v["onsets_t"]:
+            for a in (ax, ar):
+                a.axvline(o, color=CRITICAL, lw=0.8, alpha=0.6)
+        ax.set_ylabel("동맥압 MAP\n(mmHg)")
+        tag = "저혈압 있음" if v["has_onset"] else "저혈압 없음"
+        ax.set_title(f"케이스 {e['caseid']} ({tag}) — 세로선 = 저혈압 시작", loc="left")
+        ar.plot(arr(e["risk_t"]), arr(e["risk"]["5"]), color=BLUE, lw=1.6,
+                label="미세조정 encoder (5분)")
+        ar.plot(arr(v["risk_t"]), arr(v["risk"]["5"]), color=MUTED, lw=1.2,
+                label="고정 encoder + 선형 (5분, 상대값)")
+        ar.set_ylim(0, 1)
+        ar.set_ylabel("5분 내\n저혈압 위험")
+        ar.set_xlim(ax.get_xlim())
+        if i == 0:
+            ar.legend(loc="upper right", ncol=2, fontsize=9)
+            ax.legend(loc="upper right", fontsize=9)
+    axes[-1, 0].set_xlabel("마취 시작 후 시간 (분)")
+    fig.tight_layout()
+    fig.savefig(out / "ft_risk_timelines.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("json")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--finetune", help="finetune_ioh.py result.json (pre-trained encoder)")
+    ap.add_argument("--scratch", help="finetune_ioh.py result.json (--scratch)")
     args = ap.parse_args()
     d = json.loads(Path(args.json).read_text())
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     setup()
+    if args.finetune:
+        ft = json.loads(Path(args.finetune).read_text())
+        sc = json.loads(Path(args.scratch).read_text()) if args.scratch else None
+        finetune_figs(d, ft, sc, out)
+        print(f"figures in {out}")
+        return
     forecast_examples(d, out)
     risk_timelines(d, out)
     roc(d, out)
