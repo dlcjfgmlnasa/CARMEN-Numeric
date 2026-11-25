@@ -475,10 +475,12 @@ def main() -> None:
             ("hypo_minutes", "저혈압 누적 시간 (단일 지표)", AQUA),
             ("hand_gbm", "수작업 특징 + GBM", MUTED),
             ("numeric_ft", "수치만 (미세조정)", ORANGE),
-            ("fusion:eap", "수치 + 파형 (ABP+ECG+PPG)", BLUE),
-            ("fusion:ep", "수치 + 파형 (동맥관 없음)", "#6250d6"),
-            ("fusion:a", "수치 + 파형 (ABP만)", "#e87ba4"),
-            ("fusion:none", "수치 + 파형 모델, 파형 없음", INK2),
+            ("fusion:eap", "cross-attn 융합 (ABP+ECG+PPG)", BLUE),
+            ("fusion:ep", "cross-attn 융합 (동맥관 없음)", "#6250d6"),
+            ("fusion:none", "cross-attn 융합, 파형 없음", INK2),
+            ("gatef:eap", "잔차 융합 (ABP+ECG+PPG)", "#1d4f91"),
+            ("gatef:ep", "잔차 융합 (동맥관 없음)", "#9b8ce8"),
+            ("gatef:none", "잔차 융합, 파형 없음", "#5c5b57"),
         ])
         print(f"figures in {out}")
         return
