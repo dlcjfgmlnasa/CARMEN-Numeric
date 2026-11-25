@@ -83,12 +83,24 @@ class TokenSource:
 
     def __init__(self, path: Path, part: str, samples: dict, device, mode: str) -> None:
         meta = np.load(path / f"{part}_meta.npz")
+        rows = None  # token rows of the samples, when the token file covers more samples
         if not (np.array_equal(meta["caseid"], samples["caseid"])
                 and np.allclose(meta["t"], samples["t"])):
-            raise ValueError(f"{part}: token order does not match the samples")
-        load = lambda name: (  # noqa: E731
-            torch.from_numpy(np.load(path / f"{name}_tokens.npy")).to(device),
-            torch.from_numpy(np.load(path / f"{name}_valid.npy")).to(device))
+            where = {(int(c), round(float(t), 3)): i
+                     for i, (c, t) in enumerate(zip(meta["caseid"], meta["t"], strict=True))}
+            try:
+                rows = np.array([where[(int(c), round(float(t), 3))]
+                                 for c, t in zip(samples["caseid"], samples["t"], strict=True)])
+            except KeyError as e:
+                raise ValueError(f"{part}: sample {e} has no tokens") from None
+
+        def load(name: str) -> tuple[torch.Tensor, torch.Tensor]:
+            tok = np.load(path / f"{name}_tokens.npy", mmap_mode="r")
+            val = np.load(path / f"{name}_valid.npy")
+            if rows is not None:
+                tok, val = tok[rows], val[rows]
+            return (torch.from_numpy(np.ascontiguousarray(tok)).to(device),
+                    torch.from_numpy(val).to(device))
         self.mode = mode
         if mode == "joint":
             self.tok, self.valid = load(part)
