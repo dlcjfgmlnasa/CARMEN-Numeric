@@ -361,10 +361,12 @@ def fusion_figs(viz: dict, runs: list[tuple[str, dict, str, str]], out: Path) ->
 
 
 def robust_fig(cmp: dict, out: Path, models: list[tuple[str, str, str, str]],
-               reference: str = "numeric_ft", conds: list[tuple[str, str]] | None = None) -> None:
+               reference: str = "numeric_ft", conds: list[tuple[str, str]] | None = None,
+               delta: bool = False, name: str = "robust.png") -> None:
     """AUROC / AUPRC under missing-waveform conditions (compare_ioh output).
 
     ``models``: (prefix in ``compare_ioh --scores NAME``, label, color, linestyle).
+    ``delta``: plot the paired difference to ``reference`` (same bootstrap draws) instead.
     """
     conds = conds or [("full", "전체"), ("no_abp", "동맥압 파형 없음\n(ECG+PPG)"),
                       ("abp_only", "동맥압 파형만"), ("no_wave", "파형 없음")]
@@ -376,26 +378,32 @@ def robust_fig(cmp: dict, out: Path, models: list[tuple[str, str, str, str]],
         for row, key in enumerate(("auroc", "auprc")):
             ax = axes[row, col]
             ref = ms[reference]
-            ax.axhspan(ref[f"{key}_ci"][0], ref[f"{key}_ci"][1], color=MUTED, alpha=0.15, lw=0)
-            ax.axhline(ref[key], color=MUTED, lw=1.5, ls="--", label="수치만 (미세조정)")
+            k = f"d_{key}" if delta else key
+            if delta:
+                ax.axhline(0, color=MUTED, lw=1.5, ls="--", label="수치만 (미세조정) = 0")
+            else:
+                ax.axhspan(ref[f"{key}_ci"][0], ref[f"{key}_ci"][1], color=MUTED, alpha=0.15,
+                           lw=0)
+                ax.axhline(ref[key], color=MUTED, lw=1.5, ls="--", label="수치만 (미세조정)")
             for i, (prefix, label, color, ls) in enumerate(models):
-                xs = x + (i - (len(models) - 1) / 2) * 0.07  # dodge
-                ys = [ms[f"{prefix}:{c}"][key] for c, _ in conds]
-                lo = [ms[f"{prefix}:{c}"][f"{key}_ci"][0] for c, _ in conds]
-                hi = [ms[f"{prefix}:{c}"][f"{key}_ci"][1] for c, _ in conds]
+                xs = x + (i - (len(models) - 1) / 2) * (0.07 if ls != "none" else 0.16)
+                ys = [ms[f"{prefix}:{c}"][k] for c, _ in conds]
+                lo = [ms[f"{prefix}:{c}"][f"{k}_ci"][0] for c, _ in conds]
+                hi = [ms[f"{prefix}:{c}"][f"{k}_ci"][1] for c, _ in conds]
                 ax.errorbar(xs, ys, yerr=[np.subtract(ys, lo), np.subtract(hi, ys)], color=color,
                             ls=ls, marker="o", ms=6, lw=2, capsize=0, elinewidth=1.2,
                             label=label)
             ax.set_xticks(x, [c[1] for c in conds], fontsize=8.5)
-            ax.set_title(f"{h}분 내 저혈압 · {key.upper()}")
+            ax.set_title(f"{h}분 내 저혈압 · {'Δ' if delta else ''}{key.upper()}")
             if col == 0:
-                ax.set_ylabel(key.upper())
+                ax.set_ylabel(f"{key.upper()} 차이 (vs 수치만)" if delta else key.upper())
     h, lab = axes[0, 0].get_legend_handles_labels()
     fig.legend(h, lab, loc="lower center", ncol=5, fontsize=9, bbox_to_anchor=(0.5, -0.03))
-    fig.suptitle("파형이 빠졌을 때 — 같은 test 환자 (회색 띠 = 수치만 모델의 95% CI)", color=INK,
-                 fontsize=13, y=1.01)
+    title = ("파형 조합별 — 수치만 모델 대비 차이 (같은 test 환자, paired bootstrap 95% CI)"
+             if delta else "파형이 빠졌을 때 — 같은 test 환자 (회색 띠 = 수치만 모델의 95% CI)")
+    fig.suptitle(title, color=INK, fontsize=13, y=1.01)
     fig.tight_layout(rect=(0, 0.03, 1, 1))
-    fig.savefig(out / "robust.png", dpi=150, bbox_inches="tight")
+    fig.savefig(out / name, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -449,7 +457,10 @@ def main() -> None:
     ap.add_argument("--robust-extra", help="second compare_ioh output merged into --robust")
     ap.add_argument("--robust-models", nargs="+", default=None,
                     help="PREFIX=LABEL entries for --robust (default: the dropout comparison)")
-    ap.add_argument("--robust-conds", nargs="+", default=None, help="COND=LABEL entries")
+    ap.add_argument("--robust-conds", nargs="+", default=None,
+                    help="COND=LABEL entries (\\n in LABEL = line break)")
+    ap.add_argument("--robust-delta", action="store_true",
+                    help="also draw robust_delta.png (paired difference to numeric_ft)")
     ap.add_argument("--case", nargs=2, action="append", default=[], metavar=("TASK", "JSON"),
                     help="compare_ioh output of a case-level task (repeatable)")
     ap.add_argument("--compare-methods", nargs="+", default=[],
@@ -473,11 +484,15 @@ def main() -> None:
         return
     if args.robust and args.robust_models:
         cols = [BLUE, "#6250d6", ORANGE, MUTED]
-        models = [(kv.split("=", 1)[0], kv.split("=", 1)[1], cols[i % len(cols)], "-")
+        # conditions are categories: markers only, no connecting lines
+        models = [(kv.split("=", 1)[0], kv.split("=", 1)[1], cols[i % len(cols)], "none")
                   for i, kv in enumerate(args.robust_models)]
-        conds = [tuple(kv.split("=", 1)) for kv in args.robust_conds] if args.robust_conds \
-            else None
-        robust_fig(json.loads(Path(args.robust).read_text()), out, models, conds=conds)
+        conds = [(c, lab.replace("\\n", "\n")) for c, lab in
+                 (kv.split("=", 1) for kv in args.robust_conds)] if args.robust_conds else None
+        cmp = json.loads(Path(args.robust).read_text())
+        robust_fig(cmp, out, models, conds=conds)
+        if args.robust_delta:
+            robust_fig(cmp, out, models, conds=conds, delta=True, name="robust_delta.png")
         print(f"figures in {out}")
         return
     if args.robust:
