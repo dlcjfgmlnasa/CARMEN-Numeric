@@ -371,3 +371,19 @@ def test_evaluate_forecast_regime():
     a = r["mae"]["a"]
     assert a["n"] > 0 and abs(a["nearest"] - a["linear"]) < 1e-9  # both = persistence
     assert r["n_cat"] == 0  # the static row is never hidden
+
+
+def test_windows_ending_at_have_no_future_rows():
+    from carmen_numeric.data.dataset import GPUWindowBatcher
+
+    s = toy_schema()
+    cases = toy_cases(s, n_rows=37)
+    norm = toy_normalizer(s, cases)
+    bt = GPUWindowBatcher(cases, norm, 16, (1,), torch.device("cpu"), keep_raw=True)
+    case = torch.tensor([0, 0, 1])
+    end = torch.tensor([3, 30, 36])
+    b = bt.windows_ending_at(case, end)
+    n_dyn = (b["row_type"] == 2).sum(1)
+    assert n_dyn.tolist() == [4, 15, 15]  # short history, then capped at span = 15
+    last_t = [b["raw"][i, int(n_dyn[i])][0].item() for i in range(3)]  # +1 for the static row
+    assert last_t == [3.0, 30.0, 36.0]  # the window ends exactly at row `end` (t = row index)

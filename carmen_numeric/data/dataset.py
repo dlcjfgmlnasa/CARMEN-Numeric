@@ -228,10 +228,17 @@ class GPUWindowBatcher:
         self.num_cases = len(n_ctx)
         self._dyn_len_host = dyn_len
 
-    def _gather(self, case: torch.Tensor, start: torch.Tensor) -> dict[str, torch.Tensor]:
+    def _gather(
+        self,
+        case: torch.Tensor,  # (B,) case index
+        start: torch.Tensor,  # (B,) first dynamic row
+        length: torch.Tensor | None = None,  # (B,) at most this many dynamic rows
+    ) -> dict[str, torch.Tensor]:
         """Window = context rows of ``case`` + up to ``span`` dynamic rows from ``start``."""
         dev = self.device
         take = (self.dyn_len[case] - start).clamp(min=0, max=self.span)
+        if length is not None:
+            take = torch.minimum(take, length)
         t_dyn = max(int(take.max()), 1)
         ar = torch.arange(t_dyn, device=dev)
         dyn_idx = self.dyn_start[case, None] + start[:, None] + ar  # (B, t_dyn)
@@ -278,6 +285,15 @@ class GPUWindowBatcher:
 
     def eval_batches(self, batch_size: int) -> EvalBatches:
         return EvalBatches(self, batch_size)
+
+    def windows_ending_at(
+        self,
+        case: torch.Tensor,  # (B,) case index
+        end: torch.Tensor,  # (B,) last dynamic row (inclusive)
+    ) -> dict[str, torch.Tensor]:
+        """Context rows + the up to ``span`` dynamic rows ending at row ``end`` (no future)."""
+        start = (end + 1 - self.span).clamp(min=0)
+        return self._gather(case, start, end + 1 - start)
 
 
 class EvalBatches:
