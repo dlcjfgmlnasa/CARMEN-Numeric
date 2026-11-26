@@ -495,6 +495,75 @@ def task_delta_fig(specs: list[tuple[str, dict, str, str, str]], out: Path,
     plt.close(fig)
 
 
+ARR_CONDS = [("eap", "ABP\nECG\nPPG"), ("ep", "ECG\nPPG"), ("e", "ECG"), ("ap", "ABP\nPPG"),
+             ("p", "PPG"), ("a", "ABP"), ("none", "파형\n없음")]
+ARR_NAME = {"NSR": "정상 동리듬 (1분 전체)", "AF": "심방세동/조동", "VA": "심실성 부정맥",
+            "BradyCond": "서맥·전도장애"}
+
+
+def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
+             reference: str = "numeric_ft", pair: str = "wave") -> None:
+    """Arrhythmia (pooled CV, ``cv_folds.py pool``): per class, each waveform condition.
+
+    ``arr_abs.png``: AUROC / AUPRC per model and condition, numeric-only as a band.
+    ``arr_delta.png``: models with numeric inputs minus the waveform-only model under the same
+    condition (``d_*_vs_<pair>``, paired patient bootstrap).
+    """
+    labels = list(cmp["horizons"])
+    x = np.arange(len(ARR_CONDS))
+    for delta in (False, True):
+        ms_draw = [m for m in models if not (delta and m[0] == pair)]
+        fig, axes = plt.subplots(2, len(labels), figsize=(4.3 * len(labels), 7.6), squeeze=False)
+        for col, h in enumerate(labels):
+            r = cmp["horizons"][h]
+            ms = r["methods"]
+            for row, key in enumerate(("auroc", "auprc")):
+                ax = axes[row, col]
+                if delta:
+                    ax.axhline(0, color=MUTED, lw=1.5, ls="--", label="파형만 = 0")
+                else:
+                    ref = ms[reference]
+                    ax.axhspan(*ref[f"{key}_ci"], color=ORANGE, alpha=0.12, lw=0)
+                    ax.axhline(ref[key], color=ORANGE, lw=1.5, ls="--", label="수치만 (미세조정)")
+                    if key == "auprc":
+                        ax.axhline(r["prevalence"], color=MUTED, lw=1, ls=":", label="발생률")
+                width = 0.22
+                for i, (prefix, label, color) in enumerate(ms_draw):
+                    dx = (i - (len(ms_draw) - 1) / 2) * width
+                    k = f"d_{key}_vs_{pair}" if delta else key
+                    pts = [(j, ms[f"{prefix}:{c}"]) for j, (c, _) in enumerate(ARR_CONDS)
+                           if f"{prefix}:{c}" in ms and k in ms[f"{prefix}:{c}"]]
+                    if not pts:
+                        continue
+                    xs = np.array([j for j, _ in pts]) + dx
+                    ys = np.array([v[k] for _, v in pts])
+                    ci = np.array([v[f"{k}_ci" if not delta else f"d_{key}_ci_vs_{pair}"]
+                                   for _, v in pts])
+                    ax.errorbar(xs, ys, yerr=[ys - ci[:, 0], ci[:, 1] - ys], fmt="o", ms=5.5,
+                                color=color, capsize=2.5, lw=1.4, mec=SURFACE, mew=1.0,
+                                label=label)
+                ax.set_xticks(x, [lab for _, lab in ARR_CONDS], fontsize=7.5)
+                ax.grid(axis="x", visible=False)
+                pos = r.get("n_cases_pos")
+                ax.set_title(f"{ARR_NAME.get(h, h)} · {'Δ' if delta else ''}{key.upper()}\n"
+                             f"(양성 {r['prevalence'] * r['n']:.0f}분"
+                             + (f", {pos}건" if pos else "") + ")", fontsize=10)
+                if col == 0:
+                    ax.set_ylabel(f"{key.upper()} 차이 (vs 파형만, 같은 조건)" if delta
+                                  else key.upper())
+        handles, labs = axes[0, 0].get_legend_handles_labels()
+        fig.legend(handles, labs, loc="lower center", ncol=len(labs), frameon=False,
+                   bbox_to_anchor=(0.5, -0.03))
+        title = ("부정맥 — 수치를 더했을 때 파형만 모델 대비 차이 "
+                 "(5겹 CV, paired patient bootstrap 95% CI)" if delta else
+                 "부정맥 — 파형 조건별 성능 (5겹 CV 통합 test, 95% CI; 주황 띠 = 수치만)")
+        fig.suptitle(title, color=INK, fontsize=13, y=1.01)
+        fig.tight_layout(rect=(0, 0.03, 1, 1))
+        fig.savefig(out / ("arr_delta.png" if delta else "arr_abs.png"), dpi=150,
+                    bbox_inches="tight")
+        plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("json")
@@ -519,6 +588,8 @@ def main() -> None:
     ap.add_argument("--task-delta", nargs=5, action="append", default=[],
                     metavar=("LABEL", "JSON", "HORIZON", "CROSS", "RESIDUAL"),
                     help="compare_ioh output per task for task_delta.png (repeatable)")
+    ap.add_argument("--arr", action="store_true",
+                    help="JSON is a pooled arrhythmia CV comparison: draw arr_abs / arr_delta")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -526,6 +597,12 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     setup()
+    if args.arr:
+        arr_figs(d, out, [("wave", "파형만 (CARMEN)", BLUE),
+                          ("fusion", "파형 + 수치 (cross-attention)", "#6250d6"),
+                          ("gatef", "파형 + 수치 (잔차, 수치 고정)", "#1d4f91")])
+        print(f"figures in {out}")
+        return
     if args.task_delta:
         task_delta_fig([(lab.replace("\\n", "\n"), json.loads(Path(pth).read_text()), h, c, r)
                         for lab, pth, h, c, r in args.task_delta], out,
