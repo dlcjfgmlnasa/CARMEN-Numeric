@@ -567,6 +567,48 @@ def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
         plt.close(fig)
 
 
+def arr_present_fig(cmp: dict, present: dict, out: Path, method: str = "bidir",
+                    pair: str = "wave") -> None:
+    """``<method>`` minus ``<pair>`` per condition: on every sample (a missing waveform leaves the
+    waveform model empty while ``<method>`` can fall back on numerics) and only on the samples
+    whose waveforms of that condition exist (``present_subset.py``)."""
+    labels = list(cmp["horizons"])
+    conds = [(c, lab) for c, lab in ARR_CONDS if c != "none"]
+    x = np.arange(len(conds))
+    fig, axes = plt.subplots(2, len(labels), figsize=(4.3 * len(labels), 7.4), squeeze=False)
+    for col, h in enumerate(labels):
+        ms, pr = cmp["horizons"][h]["methods"], present["labels"][h]
+        for row, key in enumerate(("auroc", "auprc")):
+            ax = axes[row, col]
+            ax.axhline(0, color=MUTED, lw=1.5, ls="--", label="파형만 = 0")
+            j = row  # 0: AUROC, 1: AUPRC in present_subset.py
+            series = [
+                ("전체 샘플 (파형이 없으면 수치로 대체)", AQUA, -0.14,
+                 [(ms[f"{method}:{c}"][f"d_{key}_vs_{pair}"],
+                   ms[f"{method}:{c}"][f"d_{key}_ci_vs_{pair}"]) for c, _ in conds]),
+                ("그 조건의 파형이 실제로 있는 샘플만", "#0d6e4c", 0.14,
+                 [(pr[c]["d"][j], pr[c]["d_ci"][j]) for c, _ in conds]),
+            ]
+            for label, color, dx, pts in series:
+                ys = np.array([v for v, _ in pts])
+                ci = np.array([c for _, c in pts])
+                ax.errorbar(x + dx, ys, yerr=[ys - ci[:, 0], ci[:, 1] - ys], fmt="o", ms=5.5,
+                            color=color, capsize=2.5, lw=1.4, mec=SURFACE, mew=1.0, label=label)
+            ax.set_xticks(x, [lab for _, lab in conds], fontsize=7.5)
+            ax.grid(axis="x", visible=False)
+            ax.set_title(f"{ARR_NAME.get(h, h)} · Δ{key.upper()}", fontsize=10)
+            if col == 0:
+                ax.set_ylabel(f"{key.upper()} 차이 (양방향 잔차 - 파형만)")
+    handles, labs = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labs, loc="lower center", ncol=len(labs), frameon=False,
+               bbox_to_anchor=(0.5, -0.03))
+    fig.suptitle("부정맥 — 양방향 잔차의 이득은 어디서 오는가 "
+                 "(5겹 CV, paired patient bootstrap 95% CI)", color=INK, fontsize=13, y=1.01)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.savefig(out / "arr_bidir_present.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("json")
@@ -596,6 +638,8 @@ def main() -> None:
     ap.add_argument("--arr-gbm", action="store_true",
                     help="JSON is the pooled wave_features.py comparison: draw arr_wf_abs / "
                          "arr_wf_delta")
+    ap.add_argument("--arr-present", help="present_subset.py output; with --arr also draws "
+                    "arr_bidir_present.png")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -614,6 +658,8 @@ def main() -> None:
                           ("fusion", "파형 + 수치 (cross-attention)", "#6250d6"),
                           ("gatef", "파형 + 수치 (잔차, 수치 고정)", "#1d4f91"),
                           ("bidir", "파형 + 수치 (양방향 잔차)", AQUA)])
+        if args.arr_present:
+            arr_present_fig(d, json.loads(Path(args.arr_present).read_text()), out)
         print(f"figures in {out}")
         return
     if args.task_delta:
