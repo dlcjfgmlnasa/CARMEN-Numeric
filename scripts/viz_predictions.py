@@ -75,6 +75,8 @@ def operating_points(y: np.ndarray, s: np.ndarray, per_hour: float,
                      targets=(0.5, 0.7, 0.8, 0.9)) -> list[dict]:
     pos = np.sort(s[y == 1])
     out = []
+    if pos.size == 0:  # no positives (tiny smoke splits)
+        return out
     for target in targets:
         thr = pos[int(np.floor((1 - target) * len(pos)))]
         pred = s >= thr

@@ -20,7 +20,7 @@ are read and filtered once); the single-signal subsets are independent encodings
 
 CARMEN (frozen, ``task="masked"``, any-variate packing: the three signals of a sample attend
 to each other) encodes 240 patches (0.25 s) per signal; patches are mean-pooled into 5 s
-tokens, giving ``(3 signals x 12 chunks, d_model)`` per sample. Writes per split
+tokens (``--chunk-s``), giving ``(3 signals x 12 chunks, d_model)`` per sample. Writes per split
 ``<split>_tokens.npy`` (float16, ``(n, 36, d)``), ``<split>_valid.npy`` (``(n, 36)``) and
 ``<split>_meta.npz`` (caseid, t, presence) in the sample order of the task
 (``downstream_tasks.build_task``; ``--task``). Case-level tasks give 12 windows spread over the
@@ -296,11 +296,12 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
     names = {"ecg": 0, "abp": 1, "ppg": 2}
     keep = tuple(names[k] for k in args.signals)
     s = T.build_task(args.task, load_cases(label_data, ids), schema, args.cases_csv,
-                     args.labs_csv)
+                     args.labs_csv, arr_dir=args.arr_dir)
     n = len(s["t"])
     snap = s["wave_t"].shape[1]
     if snap not in (1, N_CHUNK):
-        raise ValueError(f"{snap} windows per sample; expected 1 or {N_CHUNK}")
+        raise ValueError(f"{snap} windows per sample; expected 1 or {N_CHUNK} (case-level "
+                         "tasks need the default --chunk-s)")
     start = {}
     for c in np.unique(s["caseid"]):
         a = clin.anestart.get(c, np.nan)
@@ -331,13 +332,15 @@ def run_split(part: str, ids: list[int], args, schema, clin, enc, out: Path, t0:
             if k % 200 == 0:
                 print(f"[{part}] {k}/{len(jobs)} cases ({time.time() - t0:.0f}s)", flush=True)
     writer.close()
-    np.savez(out / f"{part}_meta.npz", caseid=s["caseid"], t=s["t"], present=present)
+    np.savez(out / f"{part}_meta.npz", caseid=s["caseid"], t=s["t"], present=present,
+             n_chunk=N_CHUNK)
     print(f"[{part}] {n} samples; signals present ECG/ABP/PPG = "
           f"{present.mean(0).round(3).tolist()}; any = {present.any(1).mean():.3f}; "
           f"outputs {list(outputs)} ({time.time() - t0:.0f}s)", flush=True)
 
 
 def main() -> None:
+    global CHUNK_S, N_CHUNK
     import pandas as pd
     import torch
 
@@ -346,6 +349,10 @@ def main() -> None:
     ap.add_argument("--vital-dir", required=True)
     ap.add_argument("--cases-csv", required=True)
     ap.add_argument("--labs-csv", default=None, help="lab_data.csv (task aki)")
+    ap.add_argument("--arr-dir", default=None,
+                    help="VitalDB Arrhythmia Database dir (task arrhythmia)")
+    ap.add_argument("--split", default=None,
+                    help="split json (default: <label-data>/split.json), e.g. a CV fold")
     ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
     ap.add_argument("--carmen-src", required=True)
     ap.add_argument("--weights", required=True)
@@ -361,7 +368,13 @@ def main() -> None:
                     choices=["ecg", "abp", "ppg"],
                     help="signals given to CARMEN (others are treated as absent), e.g. "
                          "'ecg ppg' to encode as if there were no arterial line")
+    ap.add_argument("--chunk-s", type=int, default=CHUNK_S,
+                    help="seconds per token (60 s window -> 60 / chunk-s tokens per signal); "
+                         "single-window tasks only, e.g. 2 for beat-level tasks (arrhythmia)")
     args = ap.parse_args()
+    if WIN_S % args.chunk_s or (args.chunk_s * TARGET_SR) % 25:
+        raise ValueError("--chunk-s must divide 60 s into whole 0.25 s patches")
+    CHUNK_S, N_CHUNK = args.chunk_s, WIN_S // args.chunk_s
 
     torch.set_num_threads(4)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -369,7 +382,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     label_data = Path(args.label_data)
     schema = TableSchema.load(label_data / "schema.json")
-    split = json.loads((label_data / "split.json").read_text())
+    split = json.loads(Path(args.split or label_data / "split.json").read_text())
     clin = pd.read_csv(args.cases_csv, usecols=["caseid", "anestart"]).set_index("caseid")
     enc = CarmenEncoder(args.carmen_src, args.weights, device)
     t0 = time.time()

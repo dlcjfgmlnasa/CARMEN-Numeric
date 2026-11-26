@@ -101,8 +101,10 @@ class TokenSource:
                 raise ValueError(f"{part}: sample {e} has no tokens") from None
 
         def load(name: str) -> tuple[torch.Tensor, torch.Tensor]:
+            global N_CHUNK
             tok = np.load(path / f"{name}_tokens.npy", mmap_mode="r")
             val = np.load(path / f"{name}_valid.npy")
+            N_CHUNK = tok.shape[1] // N_SIG  # 12 (5 s tokens) unless --chunk-s was changed
             if rows is not None:
                 tok, val = tok[rows], val[rows]
             return (torch.from_numpy(np.ascontiguousarray(tok)).to(device),
@@ -309,6 +311,10 @@ def main() -> None:
     ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
     ap.add_argument("--cases-csv", default=None, help="clinical_data.csv (case-level tasks)")
     ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
+    ap.add_argument("--arr-dir", default=None,
+                    help="VitalDB Arrhythmia Database dir (task arrhythmia)")
+    ap.add_argument("--split", default=None,
+                    help="split json (default: <label-data>/split.json), e.g. a CV fold")
     ap.add_argument("--init-from", default=None,
                     help="--mode gated: finetune_ioh.py best.pt for the encoder + numeric head")
     ap.add_argument("--freeze-numeric", action="store_true",
@@ -327,11 +333,12 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     data, label_data, tok_dir = Path(args.data), Path(args.label_data), Path(args.tokens)
     lschema = TableSchema.load(label_data / "schema.json")
-    split = json.loads((label_data / "split.json").read_text())
+    split = json.loads(Path(args.split or label_data / "split.json").read_text())
     ids = {p: sorted(split[p])[: args.max_cases] for p in P.PARTS}
     t0 = time.time()
     samples = {p: T.build_task(args.task, load_cases(label_data, ids[p]), lschema,
-                               args.cases_csv, args.labs_csv) for p in P.PARTS}
+                               args.cases_csv, args.labs_csv,
+                               arr_dir=args.arr_dir) for p in P.PARTS}
     labels = samples["train"]["labels"]
     simple_name, simple_col, simple_sign = samples["train"]["simple"]
     counts = {p: len(samples[p]["t"]) for p in P.PARTS}

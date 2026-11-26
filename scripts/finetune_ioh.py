@@ -124,6 +124,10 @@ def main() -> None:
     ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
     ap.add_argument("--cases-csv", default=None, help="clinical_data.csv (case-level tasks)")
     ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
+    ap.add_argument("--arr-dir", default=None,
+                    help="VitalDB Arrhythmia Database dir (task arrhythmia)")
+    ap.add_argument("--split", default=None,
+                    help="split json (default: <label-data>/split.json), e.g. a CV fold")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -134,11 +138,12 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     data, label_data = Path(args.data), Path(args.label_data)
     lschema = TableSchema.load(label_data / "schema.json")
-    split = json.loads((label_data / "split.json").read_text())
+    split = json.loads(Path(args.split or label_data / "split.json").read_text())
     ids = {p: sorted(split[p])[: args.max_cases] for p in P.PARTS}
     t0 = time.time()
     samples = {p: T.build_task(args.task, load_cases(label_data, ids[p]), lschema,
-                               args.cases_csv, args.labs_csv) for p in P.PARTS}
+                               args.cases_csv, args.labs_csv,
+                               arr_dir=args.arr_dir) for p in P.PARTS}
     labels = samples["train"]["labels"]
     simple_name, simple_col, simple_sign = samples["train"]["simple"]
     counts = {p: len(samples[p]["t"]) for p in P.PARTS}

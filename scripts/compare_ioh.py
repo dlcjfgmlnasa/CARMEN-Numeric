@@ -76,11 +76,18 @@ def main() -> None:
     ap.add_argument("--frozen", nargs=2, default=None, metavar=("NAME", "CKPT"),
                     help="pre-trained checkpoint for the frozen-encoder linear probe")
     ap.add_argument("--reference", default="hand_gbm")
+    ap.add_argument("--dump", default=None,
+                    help="also save the test labels / scores of every method (.npz) for "
+                         "pooling cross-validation folds (pool_folds.py)")
     ap.add_argument("--n-boot", type=int, default=1000)
     ap.add_argument("--max-cases", type=int, default=None)
     ap.add_argument("--task", default="ioh", choices=list(T.TASKS))
     ap.add_argument("--cases-csv", default=None, help="clinical_data.csv (case-level tasks)")
     ap.add_argument("--labs-csv", default=None, help="lab_data.csv (aki)")
+    ap.add_argument("--arr-dir", default=None,
+                    help="VitalDB Arrhythmia Database dir (task arrhythmia)")
+    ap.add_argument("--split", default=None,
+                    help="split json (default: <label-data>/split.json), e.g. a CV fold")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -89,10 +96,11 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data, label_data = Path(args.data), Path(args.label_data)
     lschema = TableSchema.load(label_data / "schema.json")
-    split = json.loads((label_data / "split.json").read_text())
+    split = json.loads(Path(args.split or label_data / "split.json").read_text())
     ids = {p: sorted(split[p])[: args.max_cases] for p in P.PARTS}
     samples = {p: T.build_task(args.task, load_cases(label_data, ids[p]), lschema,
-                               args.cases_csv, args.labs_csv) for p in P.PARTS}
+                               args.cases_csv, args.labs_csv,
+                               arr_dir=args.arr_dir) for p in P.PARTS}
     labels = samples["train"]["labels"]
     simple_name, simple_col, simple_sign = samples["train"]["simple"]
     te = samples["test"]
@@ -122,6 +130,7 @@ def main() -> None:
         del enc
 
     res: dict = {"task": args.task, "reference": args.reference, "horizons": {}}
+    dump: dict[str, np.ndarray] = {}
     for k, h in enumerate(labels):
         ok = {p: ~np.isnan(samples[p]["y"][:, k]) for p in P.PARTS}
         y = {p: samples[p]["y"][ok[p], k] for p in P.PARTS}
@@ -135,6 +144,10 @@ def main() -> None:
             scores[frozen[0]] = s
         for name, lg in logits.items():
             scores[name] = lg[ok["test"], k]
+        dump[f"y__{h}"] = y["test"]
+        dump[f"caseid__{h}"] = te["caseid"][ok["test"]]
+        dump[f"t__{h}"] = te["t"][ok["test"]]
+        dump.update({f"score__{h}__{m}": np.asarray(v, np.float64) for m, v in scores.items()})
         r = paired(y["test"], te["caseid"][ok["test"]], scores, args.reference, args.n_boot)
         res["horizons"][str(h)] = {"n": int(len(y["test"])),
                                    "prevalence": float(y["test"].mean()), "methods": r}
@@ -148,6 +161,8 @@ def main() -> None:
                          f"[{v['d_auprc_ci'][0]:+.3f},{v['d_auprc_ci'][1]:+.3f}]")
             print(line, flush=True)
     Path(args.out).write_text(json.dumps(res, indent=1))
+    if args.dump:
+        np.savez(args.dump, labels=np.array([str(h) for h in labels]), **dump)
     print(f"wrote {args.out}")
 
 
