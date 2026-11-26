@@ -95,7 +95,12 @@ class TokenSource:
     exact because no signal saw another.
     """
 
-    def __init__(self, path: Path, part: str, samples: dict, device, mode: str) -> None:
+    def __init__(self, path: Path, part: str, samples: dict, device, mode: str,
+                 store=None) -> None:
+        # store: where the token arrays live ("cpu" when they do not fit on the GPU; batches
+        # are gathered there and moved to ``device``)
+        self.device = device
+        self.store = torch.device(store) if store is not None else device
         meta = np.load(path / f"{part}_meta.npz")
         rows = None  # token rows of the samples, when the token file covers more samples
         if not (np.array_equal(meta["caseid"], samples["caseid"])
@@ -115,8 +120,8 @@ class TokenSource:
             N_CHUNK = tok.shape[1] // N_SIG  # 12 (5 s tokens) unless --chunk-s was changed
             if rows is not None:
                 tok, val = tok[rows], val[rows]
-            return (torch.from_numpy(np.ascontiguousarray(tok)).to(device),
-                    torch.from_numpy(val).to(device))
+            return (torch.from_numpy(np.ascontiguousarray(tok)).to(self.store),
+                    torch.from_numpy(val).to(self.store))
         self.mode = mode
         if mode == "joint":
             self.tok, self.valid = load(part)
@@ -131,18 +136,23 @@ class TokenSource:
             self.tok, self.valid = self.tok_all[6], self.valid_all[6]  # all signals
         else:
             raise ValueError(mode)
-        sig = self.valid.view(-1, N_SIG, N_CHUNK).any(-1)  # (n, 3) signal present
+        sig = self.valid.view(-1, N_SIG, N_CHUNK).any(-1).to(device)  # (n, 3) signal present
         self.present_bits = (sig.long() * torch.tensor([1, 2, 4], device=device)).sum(-1)
+
+    def _out(self, tok: torch.Tensor, valid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return tok.to(self.device), valid.to(self.device)
 
     def get(self, idx: torch.Tensor, bits: torch.Tensor | None = None
             ) -> tuple[torch.Tensor, torch.Tensor]:
+        i = idx.to(self.store)
         if bits is None:
-            return self.tok[idx], self.valid[idx]
+            return self._out(self.tok[i], self.valid[i])
         bits = bits & self.present_bits[idx]
         if self.mode != "subsets":
-            return self.tok[idx], self.valid[idx] & slot_mask(bits)
-        k = (bits - 1).clamp(min=0)
-        tok, valid = self.tok_all[k, idx], self.valid_all[k, idx]
+            tok, valid = self._out(self.tok[i], self.valid[i])
+            return tok, valid & slot_mask(bits)
+        k = (bits - 1).clamp(min=0).to(self.store)
+        tok, valid = self._out(self.tok_all[k, i], self.valid_all[k, i])
         return tok, valid & (bits > 0)[:, None]
 
 
@@ -402,6 +412,9 @@ def main() -> None:
     ap.add_argument("--eval-only", default=None,
                     help="best.pt of an earlier run: skip training, score test conditions")
     ap.add_argument("--token-mode", default="joint", choices=["joint", "subsets", "independent"])
+    ap.add_argument("--token-device", default=None, choices=["cpu"],
+                    help="keep CARMEN tokens in host memory and move batches to the GPU "
+                         "(when the tokens do not fit next to other jobs)")
     ap.add_argument("--subset-train", nargs=2, type=float, default=None,
                     metavar=("P_FULL", "P_NONE"),
                     help="training: per-sample random signal subsets (instead of --drop-*)")
@@ -445,7 +458,8 @@ def main() -> None:
     labels = samples["train"]["labels"]
     simple_name, simple_col, simple_sign = samples["train"]["simple"]
     counts = {p: len(samples[p]["t"]) for p in P.PARTS}
-    toks = {p: TokenSource(tok_dir, p, samples[p], device, args.token_mode) for p in P.PARTS}
+    toks = {p: TokenSource(tok_dir, p, samples[p], device, args.token_mode, args.token_device)
+            for p in P.PARTS}
     d_carmen = toks["train"].tok.shape[-1]
     wave_rate = {p: float(toks[p].valid.any(1).float().mean()) for p in P.PARTS}
     print(f"samples {counts}; with waveform {wave_rate} ({time.time() - t0:.0f}s)", flush=True)
