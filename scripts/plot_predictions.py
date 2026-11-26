@@ -530,7 +530,7 @@ def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
                     ax.axhline(ref[key], color=ORANGE, lw=1.5, ls="--", label=ref_label)
                     if key == "auprc":
                         ax.axhline(r["prevalence"], color=MUTED, lw=1, ls=":", label="발생률")
-                width = 0.22
+                width = min(0.22, 0.8 / len(ms_draw))
                 for i, (prefix, label, color) in enumerate(ms_draw):
                     dx = (i - (len(ms_draw) - 1) / 2) * width
                     k = f"d_{key}_vs_{pair}" if delta else key
@@ -612,7 +612,8 @@ def main() -> None:
     if args.arr:
         arr_figs(d, out, [("wave", "파형만 (CARMEN)", BLUE),
                           ("fusion", "파형 + 수치 (cross-attention)", "#6250d6"),
-                          ("gatef", "파형 + 수치 (잔차, 수치 고정)", "#1d4f91")])
+                          ("gatef", "파형 + 수치 (잔차, 수치 고정)", "#1d4f91"),
+                          ("bidir", "파형 + 수치 (양방향 잔차)", AQUA)])
         print(f"figures in {out}")
         return
     if args.task_delta:
