@@ -19,7 +19,15 @@ branch (cross-attention blocks + MLP whose last layer starts at zero), so the mo
 numeric-only model; with ``--init-from`` (a ``finetune_ioh.py`` ``best.pt``) it starts from
 that model's weights and the step-0 state competes in checkpoint selection, and with
 ``--freeze-numeric`` only the waveform branch is trained (the numeric model is kept as is, in
-eval mode, so the checkpoints differ only by the waveform residual). CARMEN stays
+eval mode, so the checkpoints differ only by the waveform residual). ``bidir``: both
+single-modality models frozen — the numeric model of ``--init-from`` and the waveform model of
+``--wave-from`` (a ``--mode wave`` ``best.pt``) — mixed per signal subset actually present
+(``a[s] * z_numeric + b[s] * z_wave + c[s]``, one weight per subset and label) plus a residual
+cross-attention branch (numeric queries over waveform tokens, last layer zero). Each subset's
+weights start at the single-modality model that has the higher val AUROC for that subset and
+label, so the step-0 model is the better of the two per waveform condition — the "primary"
+modality is chosen by the data, in either direction — and step 0 competes in checkpoint
+selection. The frozen numeric encoder is run once per split (cached). CARMEN stays
 frozen. The step with the best mean val AUROC is kept; test metrics, curves and logits
 (``test_scores.npz``) are written.
 
@@ -260,6 +268,96 @@ class FusionModel(nn.Module):
         return self.head(self.cross(q, mem, pad).flatten(1))
 
 
+class NumericCache:
+    """Frozen numeric model outputs per sample: queries ``(n, 3, m)`` and logits ``(n, H)``."""
+
+    def __init__(self, model: FusionModel, win, n: int, device, batch_size: int = 512) -> None:
+        qs, zs = [], []
+        model.eval()
+        with torch.no_grad():
+            for s in range(0, n, batch_size):
+                idx = torch.arange(s, min(s + batch_size, n), device=device)
+                q = model.numeric_queries(win.batch(idx)).float()
+                qs.append(q.half())
+                zs.append(model.head(q.flatten(1)).float())
+        self.q, self.z = torch.cat(qs), torch.cat(zs)
+
+    def batch(self, idx: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {"q": self.q[idx], "z": self.z[idx]}
+
+
+class BidirModel(nn.Module):
+    """``a[s] * z_numeric + b[s] * z_wave + c[s] + residual`` (``s`` = signal subset present)."""
+
+    def __init__(self, wave_model: FusionModel, d_carmen: int, m: int, n_out: int,
+                 dropout: float = 0.1) -> None:
+        super().__init__()
+        self.mode = "bidir"
+        self.wave_model = wave_model
+        for p in wave_model.parameters():
+            p.requires_grad_(False)
+        self.wave = WaveTokens(d_carmen, m)
+        self.cross = CrossBlocks(m, dropout=dropout)
+        self.res_head = FusionModel._mlp(3 * m, n_out, dropout)
+        nn.init.zeros_(self.res_head[-1].weight)
+        nn.init.zeros_(self.res_head[-1].bias)
+        self.a = nn.Parameter(torch.ones(8, n_out))  # index = subset bitmask (ECG 1, ABP 2, PPG 4)
+        self.b = nn.Parameter(torch.zeros(8, n_out))
+        self.c = nn.Parameter(torch.zeros(8, n_out))
+        self.register_buffer("bit", torch.tensor([1, 2, 4]), persistent=False)
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.wave_model.eval()
+        return self
+
+    def present(self, valid: torch.Tensor) -> torch.Tensor:  # (B, 3 * N_CHUNK) -> (B,) bits
+        return (valid.view(len(valid), N_SIG, -1).any(-1).long() * self.bit).sum(-1)
+
+    def forward(self, batch, tok: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            zw = self.wave_model(None, tok, valid).float()
+        mem, pad = self.wave(tok, valid)
+        res = self.res_head(self.cross(batch["q"].float(), mem, pad).flatten(1))
+        s = self.present(valid)
+        return self.a[s] * batch["z"] + self.b[s] * zw + self.c[s] + res
+
+    @torch.no_grad()
+    def init_mix(self, y: np.ndarray, cache: NumericCache, src: TokenSource, device,
+                 min_pos: int = 10) -> list[dict]:
+        """Start each (subset, label) at the single-modality model with the higher val AUROC,
+        pooling val samples over the forced conditions by the subset actually present."""
+        self.eval()
+        n = len(y)
+        zs, ws, ss = [], [], []
+        for cond in CONDITIONS:
+            for s0 in range(0, n, 512):
+                idx = torch.arange(s0, min(s0 + 512, n), device=device)
+                bits = torch.full((len(idx),), COND_MASK[cond], device=device, dtype=torch.long)
+                tok, valid = src.get(idx, bits)
+                zw = self.wave_model(None, tok, valid).float()
+                zs.append(cache.z[idx].cpu())
+                ws.append(zw.cpu())
+                ss.append(self.present(valid).cpu())
+        zn, zw, sub = torch.cat(zs).numpy(), torch.cat(ws).numpy(), torch.cat(ss).numpy()
+        yy = np.tile(y, (len(CONDITIONS), 1))
+        table = []
+        for s in range(8):
+            for k in range(y.shape[1]):
+                ok = (sub == s) & ~np.isnan(yy[:, k])
+                pos = int(np.nansum(yy[ok, k]))
+                an = P.auroc(yy[ok, k], zn[ok, k]) if pos >= min_pos and pos < ok.sum() else np.nan
+                aw = P.auroc(yy[ok, k], zw[ok, k]) if pos >= min_pos and pos < ok.sum() else np.nan
+                wave_first = s > 0 and np.isfinite(aw) and aw > an
+                self.a[s, k], self.b[s, k] = (0.0, 1.0) if wave_first else (1.0, 0.0)
+                table.append({"subset": SUBSET_NAME.get(s, "none"), "label": k,
+                              "n": int(ok.sum()), "pos": pos,
+                              "val_auroc_numeric": None if np.isnan(an) else round(float(an), 4),
+                              "val_auroc_wave": None if np.isnan(aw) else round(float(aw), 4),
+                              "primary": "wave" if wave_first else "numeric"})
+        return table
+
+
 @torch.no_grad()
 def predict_cond(model, win, src: TokenSource, cond: str, n: int, device,
                  batch_size: int = 512) -> np.ndarray:
@@ -280,7 +378,8 @@ def predict_cond(model, win, src: TokenSource, cond: str, n: int, device,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--mode", required=True, choices=["fusion", "wave", "late", "gated"])
+    ap.add_argument("--mode", required=True,
+                    choices=["fusion", "wave", "late", "gated", "bidir"])
     ap.add_argument("--data", required=True)
     ap.add_argument("--label-data", required=True)
     ap.add_argument("--ckpt", required=True, help="pre-trained UniTTab (also sets d_model)")
@@ -319,10 +418,14 @@ def main() -> None:
                     help="--mode gated: finetune_ioh.py best.pt for the encoder + numeric head")
     ap.add_argument("--freeze-numeric", action="store_true",
                     help="--mode gated with --init-from: train only the waveform branch")
+    ap.add_argument("--wave-from", default=None,
+                    help="--mode bidir: finetune_fusion.py --mode wave best.pt (frozen)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    if args.init_from and args.mode != "gated":
-        ap.error("--init-from needs --mode gated")
+    if args.init_from and args.mode not in ("gated", "bidir"):
+        ap.error("--init-from needs --mode gated or bidir")
+    if args.mode == "bidir" and not (args.init_from and args.wave_from):
+        ap.error("--mode bidir needs --init-from (numeric) and --wave-from (waveform)")
     if args.freeze_numeric and not args.init_from:
         ap.error("--freeze-numeric needs --init-from")
 
@@ -352,8 +455,29 @@ def main() -> None:
     win = {p: F.Windows(data, list(samples[p]["caseid"]), samples[p]["caseid"],
                         samples[p]["t"], encoder.cfg.max_rows, device)
            for p in P.PARTS} if args.mode != "wave" else {p: None for p in P.PARTS}
-    model = FusionModel(args.mode, encoder, d_carmen, m, len(labels)).to(device)
-    if args.init_from:
+    mix_init = None
+    if args.mode == "bidir":
+        num = FusionModel("gated", encoder, d_carmen, m, len(labels))
+        ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
+        missing, unexpected = num.load_state_dict(ck["model"], strict=False)
+        if unexpected or any(k.startswith(("encoder.", "head.")) for k in missing):
+            raise ValueError(f"{args.init_from}: not a finetune_ioh.py model of this size")
+        num.to(device)
+        win = {p: NumericCache(num, win[p], counts[p], device) for p in P.PARTS}
+        del num, encoder
+        wck = torch.load(args.wave_from, map_location="cpu", weights_only=False)
+        if wck["mode"] != "wave":
+            raise ValueError(f"{args.wave_from} is a {wck['mode']} model, not wave")
+        wave_model = FusionModel("wave", None, d_carmen, m, len(labels))
+        wave_model.load_state_dict(wck["model"])
+        model = BidirModel(wave_model, d_carmen, m, len(labels)).to(device)
+        mix_init = model.init_mix(samples["val"]["y"], win["val"], toks["val"], device)
+        print("bidir start (primary per subset / label): " + "  ".join(
+            f"{r['subset']}:{r['label']}={r['primary'][0]}" for r in mix_init), flush=True)
+        print(f"numeric outputs cached ({time.time() - t0:.0f}s)", flush=True)
+    else:
+        model = FusionModel(args.mode, encoder, d_carmen, m, len(labels)).to(device)
+    if args.init_from and args.mode != "bidir":
         ck = torch.load(args.init_from, map_location="cpu", weights_only=False)
         missing, unexpected = model.load_state_dict(ck["model"], strict=False)
         if unexpected or any(k.startswith(("encoder.", "head.")) for k in missing):
@@ -361,11 +485,17 @@ def main() -> None:
         model.to(device)
         if args.freeze_numeric:
             model.freeze_numeric()
-    enc_params = [p for p in model.encoder.parameters() if p.requires_grad] \
-        if model.encoder is not None else []
-    enc_ids = {id(p) for p in model.encoder.parameters()} if model.encoder is not None else set()
-    other = [p for p in model.parameters() if id(p) not in enc_ids and p.requires_grad]
+    encoder_of = getattr(model, "encoder", None)
+    enc_params = [p for p in encoder_of.parameters() if p.requires_grad] \
+        if encoder_of is not None else []
+    enc_ids = {id(p) for p in encoder_of.parameters()} if encoder_of is not None else set()
+    mix = [model.a, model.b, model.c] if args.mode == "bidir" else []
+    mix_ids = {id(p) for p in mix}
+    other = [p for p in model.parameters()
+             if id(p) not in enc_ids | mix_ids and p.requires_grad]
     groups = [{"params": other, "lr": args.lr_head}]
+    if mix:  # mixing weights: no weight decay (it would pull the start model towards 0)
+        groups.append({"params": mix, "lr": args.lr_head, "weight_decay": 0.0})
     if enc_params:
         groups.append({"params": enc_params, "lr": args.lr_enc})
     opt = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
@@ -441,6 +571,9 @@ def main() -> None:
                  "best_val_auroc": round(best, 4), "log": log, "counts": counts,
                  "with_waveform": wave_rate, "args": vars(args), "horizons": {},
                  "conditions": {}}
+    if mix_init is not None:
+        res["mix"] = {"init": mix_init, **{k: getattr(model, k).detach().cpu().numpy()
+                                           .round(4).tolist() for k in ("a", "b", "c")}}
     for cond, lg in cond_logits.items():
         res["conditions"][cond] = {}
         for k, h in enumerate(labels):
