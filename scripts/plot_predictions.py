@@ -502,11 +502,12 @@ ARR_NAME = {"NSR": "정상 동리듬 (1분 전체)", "AF": "심방세동/조동"
 
 
 def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
-             reference: str = "numeric_ft", pair: str = "wave") -> None:
+             reference: str = "numeric_ft", pair: str = "wave",
+             ref_label: str = "수치만 (미세조정)", name: str = "arr") -> None:
     """Arrhythmia (pooled CV, ``cv_folds.py pool``): per class, each waveform condition.
 
-    ``arr_abs.png``: AUROC / AUPRC per model and condition, numeric-only as a band.
-    ``arr_delta.png``: models with numeric inputs minus the waveform-only model under the same
+    ``<name>_abs.png``: AUROC / AUPRC per model and condition, numeric-only as a band.
+    ``<name>_delta.png``: models with numeric inputs minus the waveform-only model under the same
     condition (``d_*_vs_<pair>``, paired patient bootstrap).
     """
     labels = list(cmp["horizons"])
@@ -524,7 +525,7 @@ def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
                 else:
                     ref = ms[reference]
                     ax.axhspan(*ref[f"{key}_ci"], color=ORANGE, alpha=0.12, lw=0)
-                    ax.axhline(ref[key], color=ORANGE, lw=1.5, ls="--", label="수치만 (미세조정)")
+                    ax.axhline(ref[key], color=ORANGE, lw=1.5, ls="--", label=ref_label)
                     if key == "auprc":
                         ax.axhline(r["prevalence"], color=MUTED, lw=1, ls=":", label="발생률")
                 width = 0.22
@@ -559,7 +560,7 @@ def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
                  "부정맥 — 파형 조건별 성능 (5겹 CV 통합 test, 95% CI; 주황 띠 = 수치만)")
         fig.suptitle(title, color=INK, fontsize=13, y=1.01)
         fig.tight_layout(rect=(0, 0.03, 1, 1))
-        fig.savefig(out / ("arr_delta.png" if delta else "arr_abs.png"), dpi=150,
+        fig.savefig(out / f"{name}_{'delta' if delta else 'abs'}.png", dpi=150,
                     bbox_inches="tight")
         plt.close(fig)
 
@@ -590,6 +591,9 @@ def main() -> None:
                     help="compare_ioh output per task for task_delta.png (repeatable)")
     ap.add_argument("--arr", action="store_true",
                     help="JSON is a pooled arrhythmia CV comparison: draw arr_abs / arr_delta")
+    ap.add_argument("--arr-gbm", action="store_true",
+                    help="JSON is the pooled wave_features.py comparison: draw arr_wf_abs / "
+                         "arr_wf_delta")
     ap.add_argument("--compare-methods", nargs="+", default=[],
                     help="NAME=LABEL entries of --compare to draw, in order")
     args = ap.parse_args()
@@ -597,6 +601,12 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     setup()
+    if args.arr_gbm:
+        arr_figs(d, out, [("wf", "파형 특징만 (GBM)", BLUE),
+                          ("wfnum", "파형 특징 + 수치 (GBM)", "#1d4f91")],
+                 reference="hand_gbm", pair="wf", ref_label="수치만 (GBM)", name="arr_wf")
+        print(f"figures in {out}")
+        return
     if args.arr:
         arr_figs(d, out, [("wave", "파형만 (CARMEN)", BLUE),
                           ("fusion", "파형 + 수치 (cross-attention)", "#6250d6"),
