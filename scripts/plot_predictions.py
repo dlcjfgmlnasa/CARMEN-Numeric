@@ -511,7 +511,9 @@ def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
     condition (``d_*_vs_<pair>``, paired patient bootstrap).
     """
     labels = list(cmp["horizons"])
-    x = np.arange(len(ARR_CONDS))
+    first = cmp["horizons"][labels[0]]["methods"]
+    conds = [(c, lab) for c, lab in ARR_CONDS if any(f"{m[0]}:{c}" in first for m in models)]
+    x = np.arange(len(conds))
     for delta in (False, True):
         ms_draw = [m for m in models if not (delta and m[0] == pair)]
         fig, axes = plt.subplots(2, len(labels), figsize=(4.3 * len(labels), 7.6), squeeze=False)
@@ -532,7 +534,7 @@ def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
                 for i, (prefix, label, color) in enumerate(ms_draw):
                     dx = (i - (len(ms_draw) - 1) / 2) * width
                     k = f"d_{key}_vs_{pair}" if delta else key
-                    pts = [(j, ms[f"{prefix}:{c}"]) for j, (c, _) in enumerate(ARR_CONDS)
+                    pts = [(j, ms[f"{prefix}:{c}"]) for j, (c, _) in enumerate(conds)
                            if f"{prefix}:{c}" in ms and k in ms[f"{prefix}:{c}"]]
                     if not pts:
                         continue
@@ -543,7 +545,7 @@ def arr_figs(cmp: dict, out: Path, models: list[tuple[str, str, str]],
                     ax.errorbar(xs, ys, yerr=[ys - ci[:, 0], ci[:, 1] - ys], fmt="o", ms=5.5,
                                 color=color, capsize=2.5, lw=1.4, mec=SURFACE, mew=1.0,
                                 label=label)
-                ax.set_xticks(x, [lab for _, lab in ARR_CONDS], fontsize=7.5)
+                ax.set_xticks(x, [lab for _, lab in conds], fontsize=7.5)
                 ax.grid(axis="x", visible=False)
                 pos = r.get("n_cases_pos")
                 ax.set_title(f"{ARR_NAME.get(h, h)} · {'Δ' if delta else ''}{key.upper()}\n"
